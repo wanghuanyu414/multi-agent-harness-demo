@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>旅行助手 Agent — LangGraph 工作流可视化</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif; background: #1a1a2e; color: #e0e0e0; line-height: 1.6; }
+  .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px 20px; text-align: center; }
+  .header h1 { font-size: 2rem; margin-bottom: 8px; }
+  .header p { opacity: 0.85; font-size: 1.05rem; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 30px 20px; }
+  .card { background: #16213e; border-radius: 12px; padding: 28px; margin-bottom: 28px; border: 1px solid #2a2a4a; }
+  .card h2 { color: #a78bfa; margin-bottom: 18px; font-size: 1.35rem; border-bottom: 2px solid #2a2a4a; padding-bottom: 10px; }
+  .mermaid-wrapper { display: flex; justify-content: center; overflow-x: auto; }
+  .mermaid { background: #1e1e3a; border-radius: 10px; padding: 20px; }
+
+  /* Legend */
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 20px; }
+  .legend-item { display: flex; align-items: center; gap: 8px; font-size: 0.9rem; }
+  .legend-dot { width: 14px; height: 14px; border-radius: 50%; }
+  .dot-purple { background: #a78bfa; }
+  .dot-green { background: #34d399; }
+  .dot-blue { background: #60a5fa; }
+  .dot-orange { background: #fb923c; }
+  .dot-gray { background: #9ca3af; }
+
+  /* Node details */
+  .nodes-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+  .node-card { background: #1e1e3a; border-radius: 10px; padding: 20px; border-left: 4px solid #a78bfa; transition: transform 0.2s, box-shadow 0.2s; }
+  .node-card:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(167,139,250,0.2); }
+  .node-card.intent { border-left-color: #60a5fa; }
+  .node-card.router { border-left-color: #34d399; }
+  .node-card.executor { border-left-color: #fb923c; }
+  .node-card.response { border-left-color: #f472b6; }
+  .node-card h4 { font-size: 1rem; margin-bottom: 8px; }
+  .node-card .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; margin-right: 6px; }
+  .tag-llm { background: #60a5fa22; color: #60a5fa; }
+  .tag-mcp { background: #fb923c22; color: #fb923c; }
+  .tag-logic { background: #34d39922; color: #34d399; }
+  .tag-builtin { background: #a78bfa22; color: #a78bfa; }
+  .node-card p { font-size: 0.85rem; color: #b0b0c0; margin-top: 8px; }
+
+  /* Flow explanation */
+  .flow-step { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 20px; }
+  .flow-num { background: #a78bfa; color: #fff; width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; flex-shrink: 0; font-size: 0.9rem; }
+  .flow-content { flex: 1; }
+  .flow-content h4 { color: #c4b5fd; margin-bottom: 6px; }
+  .flow-content p { font-size: 0.88rem; color: #b0b0c0; }
+  .flow-arrow { text-align: center; color: #a78bfa; font-size: 1.2rem; margin: 6px 0 6px 16px; }
+
+  /* Tool table */
+  .tool-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+  .tool-table th { background: #2a2a4a; padding: 10px 14px; text-align: left; color: #a78bfa; }
+  .tool-table td { padding: 10px 14px; border-bottom: 1px solid #2a2a4a; }
+  .tool-table tr:hover td { background: #1e1e3a; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.72rem; }
+  .badge-mcp { background: #fb923c22; color: #fb923c; }
+  .badge-builtin { background: #a78bfa22; color: #a78bfa; }
+
+  /* Code block */
+  pre { background: #0d1117; border-radius: 8px; padding: 16px; overflow-x: auto; font-size: 0.82rem; border: 1px solid #2a2a4a; }
+  code { font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace; }
+  .keyword { color: #ff79c6; }
+  .string { color: #f1fa8c; }
+  .comment { color: #6272a4; }
+  .func { color: #50fa7b; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🚄✈️🌤️ 旅行助手 Agent 工作流</h1>
+  <p>基于 LangGraph 1.0 + MCP 协议的智能 Agent 架构可视化</p>
+</div>
+
+<div class="container">
+
+  <!-- ==================== 图例 ==================== -->
+  <div class="card">
+    <h2>📌 图例</h2>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-dot dot-blue"></div> 意图分析节点 (LLM)</div>
+      <div class="legend-item"><div class="legend-dot dot-green"></div> 路由节点 (纯逻辑)</div>
+      <div class="legend-item"><div class="legend-dot dot-orange"></div> 执行节点 (MCP/内置)</div>
+      <div class="legend-item"><div class="legend-dot dot-purple"></div> 响应生成节点 (LLM)</div>
+      <div class="legend-item"><div class="legend-dot dot-gray"></div> 起止节点</div>
+    </div>
+  </div>
+
+  <!-- ==================== Mermaid 图 ==================== -->
+  <div class="card">
+    <h2>🗺️ LangGraph 状态图</h2>
+    <div class="mermaid-wrapper">
+      <div class="mermaid">
+graph TD
+    %% 样式定义
+    classDef startEnd fill:#374151,stroke:#9ca3af,stroke-width:2px,color:#e0e0e0,font-weight:bold
+    classDef intent fill:#1e40af,stroke:#60a5fa,stroke-width:2px,color:#e0e0e0
+    classDef router fill:#065f46,stroke:#34d399,stroke-width:2px,color:#e0e0e0
+    classDef executor fill:#9a3412,stroke:#fb923c,stroke-width:2px,color:#e0e0e0
+    classDef response fill:#5b21b6,stroke:#a78bfa,stroke-width:2px,color:#e0e0e0
+    classDef edgeLabel fill:#1a1a2e,stroke:none,color:#94a3b8,font-size:12px
+
+    START([🚀 START]):::startEnd --> analyze_intent
+
+    analyze_intent["🧠 意图分析<br/><small>analyze_intent</small><br/>LLM 分类 + 关键词降级"]:::intent
+
+    analyze_intent -->|"weather / ticket"| route_tool
+    analyze_intent -->|"chat"| generate_response
+
+    route_tool["🔀 工具路由<br/><small>route_tool</small><br/>准备 MCP 调用参数"]:::router
+
+    route_tool -->|"参数完整"| execute_tool
+    route_tool -->|"参数缺失"| generate_response
+
+    execute_tool["⚡ 工具执行<br/><small>execute_tool</small><br/>MCP / 内置工具调用"]:::executor
+
+    execute_tool --> generate_response
+
+    generate_response["💬 响应生成<br/><small>generate_response</small><br/>LLM 格式化回复"]:::response
+
+    generate_response --> END([🏁 END]):::startEnd
+
+    %% 子图：工具层
+    subgraph TOOLS["🔧 工具层"]
+        weather["🌤️ 天气查询<br/>中国天气网 (内置)"]
+        train["🚄 车票查询<br/>mcp-server-12306 (MCP)"]
+    end
+    execute_tool -.->|"调用"| TOOLS
+    style TOOLS fill:#1a1a2e22,stroke:#4a4a6a,stroke-dasharray:5,color:#94a3b8
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 工作流详解 ==================== -->
+  <div class="card">
+    <h2>🔄 工作流逐步解析</h2>
+
+    <div class="flow-step">
+      <div class="flow-num">1</div>
+      <div class="flow-content">
+        <h4>用户输入</h4>
+        <p>用户在命令行输入消息，如「<em>北京天气怎么样</em>」「<em>明天从上海到北京的高铁</em>」「<em>你好</em>」</p>
+      </div>
+    </div>
+    <div class="flow-arrow">⬇️</div>
+
+    <div class="flow-step">
+      <div class="flow-num">2</div>
+      <div class="flow-content">
+        <h4>意图分析 <span class="tag tag-llm">LLM</span></h4>
+        <p><strong>analyze_intent</strong> 节点使用 LLM 分析用户消息，判断意图（weather / ticket / chat）并提取参数（城市名、出发地、目的地、日期）。<br>
+        当 LLM 不可用时，自动降级为<strong>关键词匹配</strong>（匹配城市列表 + 天气/车票关键词）。</p>
+        <br><small>示例输出：<code>{"intent": "weather", "city": "北京"}</code></small>
+      </div>
+    </div>
+    <div class="flow-arrow">⬇️</div>
+
+    <div class="flow-step">
+      <div class="flow-num">3</div>
+      <div class="flow-content">
+        <h4>条件分支 ⚡</h4>
+        <p>
+          <strong>chat</strong> → 直接跳到 <strong>响应生成</strong><br>
+          <strong>weather / ticket</strong> → 进入 <strong>工具路由</strong>
+        </p>
+      </div>
+    </div>
+    <div class="flow-arrow">⬇️</div>
+
+    <div class="flow-step">
+      <div class="flow-num">4</div>
+      <div class="flow-content">
+        <h4>工具路由 <span class="tag tag-logic">纯逻辑</span></h4>
+        <p><strong>route_tool</strong> 节点检查参数完整性：</p>
+        <ul style="margin-left:20px; color:#b0b0c0; font-size:0.88rem; margin-top:6px;">
+          <li>天气查询需要 <strong>city</strong></li>
+          <li>车票查询需要 <strong>fromStation</strong> + <strong>toStation</strong> + <strong>date</strong></li>
+          <li>参数缺失 → 返回友好提示，直接进入响应生成</li>
+        </ul>
+      </div>
+    </div>
+    <div class="flow-arrow">⬇️</div>
+
+    <div class="flow-step">
+      <div class="flow-num">5</div>
+      <div class="flow-content">
+        <h4>工具执行 <span class="tag tag-mcp">MCP</span><span class="tag tag-builtin">内置</span></h4>
+        <p><strong>execute_tool</strong> 节点根据路由结果调用对应工具：</p>
+        <ul style="margin-left:20px; color:#b0b0c0; font-size:0.88rem; margin-top:6px;">
+          <li><strong>天气</strong> → 内置工具，直接 HTTP 调用 <code>中国天气网</code> API（无需 Key）</li>
+          <li><strong>车票</strong> → MCP 协议，通过 stdio JSON-RPC 调用 <code>mcp-server-12306</code> 服务器</li>
+        </ul>
+      </div>
+    </div>
+    <div class="flow-arrow">⬇️</div>
+
+    <div class="flow-step">
+      <div class="flow-num">6</div>
+      <div class="flow-content">
+        <h4>响应生成 <span class="tag tag-llm">LLM</span></h4>
+        <p><strong>generate_response</strong> 节点使用 LLM 将工具返回的原始数据格式化为友好的中文回复（含表情符号、表格、出行建议等）。<br>
+        LLM 失败时降级显示原始 JSON 数据。</p>
+      </div>
+    </div>
+    <div class="flow-arrow">⬇️</div>
+
+    <div class="flow-step">
+      <div class="flow-num">7</div>
+      <div class="flow-content">
+        <h4>输出</h4>
+        <p>用户看到格式化的友好回复 ✨</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 节点详情 ==================== -->
+  <div class="card">
+    <h2>🔍 节点详情</h2>
+    <div class="nodes-grid">
+      <div class="node-card intent">
+        <h4>🧠 analyze_intent</h4>
+        <span class="tag tag-llm">LLM</span><span class="tag tag-logic">降级</span>
+        <p>类型: LLM 调用 + 关键词降级<br>
+        输入: 用户消息文本<br>
+        输出: intent + extracted_params<br>
+        降级: 匹配城市列表/车票/天气关键词<br>
+        工具: 无</p>
+      </div>
+      <div class="node-card router">
+        <h4>🔀 route_tool</h4>
+        <span class="tag tag-logic">纯逻辑</span>
+        <p>类型: 同步函数<br>
+        输入: intent + extracted_params<br>
+        输出: mcp_server + tool_name + tool_args<br>
+        功能: 校验参数完整性，准备工具调用<br>
+        工具: 无</p>
+      </div>
+      <div class="node-card executor">
+        <h4>⚡ execute_tool</h4>
+        <span class="tag tag-mcp">MCP</span><span class="tag tag-builtin">内置</span>
+        <p>类型: 异步工具调用<br>
+        输入: mcp_server + tool_name + tool_args<br>
+        输出: mcp_result (原始数据)<br>
+        功能: 调用 MCP 服务器或内置工具<br>
+        工具: weather / 12306</p>
+      </div>
+      <div class="node-card response">
+        <h4>💬 generate_response</h4>
+        <span class="tag tag-llm">LLM</span>
+        <p>类型: LLM 调用 + 模板降级<br>
+        输入: intent + mcp_result / error<br>
+        输出: final_response (友好文本)<br>
+        降级: 展示原始 JSON 数据<br>
+        工具: 无</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== State 定义 ==================== -->
+  <div class="card">
+    <h2>📦 AgentState (TypedDict)</h2>
+    <p style="margin-bottom:14px; color:#b0b0c0;">LangGraph 在节点间传递的状态对象，定义于 <code>agent/state.py</code></p>
+    <pre><code><span class="keyword">class</span> <span class="func">AgentState</span>(TypedDict):
+    <span class="comment"># 对话历史（自动追加）</span>
+    <span class="string">messages</span>: Annotated[Sequence[BaseMessage], add_messages]
+
+    <span class="comment"># 意图分析结果</span>
+    <span class="string">intent</span>: str                    <span class="comment"># weather | ticket | chat</span>
+    <span class="string">extracted_params</span>: dict          <span class="comment"># {city, from_city, to_city, date}</span>
+
+    <span class="comment"># 工具路由结果</span>
+    <span class="string">mcp_server</span>: str                <span class="comment"># 目标服务器名</span>
+    <span class="string">tool_name</span>: str                 <span class="comment"># 要调用的工具名</span>
+    <span class="string">tool_args</span>: dict                 <span class="comment"># 工具参数</span>
+
+    <span class="comment"># 执行结果与最终输出</span>
+    <span class="string">mcp_result</span>: dict               <span class="comment"># MCP 工具返回的原始数据</span>
+    <span class="string">final_response</span>: str            <span class="comment"># 最终回复文本</span>
+    <span class="string">error</span>: str                     <span class="comment"># 错误信息</span></code></pre>
+  </div>
+
+  <!-- ==================== 工具注册表 ==================== -->
+  <div class="card">
+    <h2>🔧 MCP 工具注册表</h2>
+    <p style="margin-bottom:14px; color:#b0b0c0;">系统启动时自动发现并注册所有工具</p>
+    <table class="tool-table">
+      <thead>
+        <tr><th>工具名</th><th>来源</th><th>类型</th><th>说明</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>get_weather</code></td>
+          <td>weather</td>
+          <td><span class="badge badge-builtin">内置</span></td>
+          <td>通过中国天气网 API 查询城市天气（无需 Key）</td>
+        </tr>
+        <tr>
+          <td><code>get-current-date</code></td>
+          <td>12306</td>
+          <td><span class="badge badge-mcp">MCP</span></td>
+          <td>获取当前日期（用于相对日期计算）</td>
+        </tr>
+        <tr>
+          <td><code>get-station-code-of-citys</code></td>
+          <td>12306</td>
+          <td><span class="badge badge-mcp">MCP</span></td>
+          <td>通过城市名查询车站代码</td>
+        </tr>
+        <tr>
+          <td><code>get-station-code-by-names</code></td>
+          <td>12306</td>
+          <td><span class="badge badge-mcp">MCP</span></td>
+          <td>通过车站名查询车站代码</td>
+        </tr>
+        <tr>
+          <td><code>get-tickets</code></td>
+          <td>12306</td>
+          <td><span class="badge badge-mcp">MCP</span></td>
+          <td>查询 12306 余票信息（主功能）</td>
+        </tr>
+        <tr>
+          <td><code>get-interline-tickets</code></td>
+          <td>12306</td>
+          <td><span class="badge badge-mcp">MCP</span></td>
+          <td>查询中转车票</td>
+        </tr>
+        <tr>
+          <td><code>get-train-route-stations</code></td>
+          <td>12306</td>
+          <td><span class="badge badge-mcp">MCP</span></td>
+          <td>查询列车途经站点</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ==================== MCP 通信协议 ==================== -->
+  <div class="card">
+    <h2>📡 MCP 通信协议 (JSON-RPC 2.0 over stdio)</h2>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
+      <div>
+        <h4 style="color:#60a5fa; margin-bottom:10px;">👈 客户端 → 服务器</h4>
+        <pre><code><span class="comment">// 1. 初始化握手</span>
+{<span class="string">"jsonrpc"</span>: <span class="string">"2.0"</span>, <span class="string">"id"</span>: 1,
+ <span class="string">"method"</span>: <span class="string">"initialize"</span>,
+ <span class="string">"params"</span>: {<span class="string">"protocolVersion"</span>: <span class="string">"2024-11-05"</span>,
+            <span class="string">"clientInfo"</span>: {<span class="string">"name"</span>: <span class="string">"travel-agent"</span>}}}
+
+<span class="comment">// 2. 列出工具</span>
+{<span class="string">"jsonrpc"</span>: <span class="string">"2.0"</span>, <span class="string">"id"</span>: 2,
+ <span class="string">"method"</span>: <span class="string">"tools/list"</span>}
+
+<span class="comment">// 3. 调用工具</span>
+{<span class="string">"jsonrpc"</span>: <span class="string">"2.0"</span>, <span class="string">"id"</span>: 3,
+ <span class="string">"method"</span>: <span class="string">"tools/call"</span>,
+ <span class="string">"params"</span>: {<span class="string">"name"</span>: <span class="string">"get-tickets"</span>,
+            <span class="string">"arguments"</span>: {<span class="string">"date"</span>: <span class="string">"2026-06-07"</span>,
+                           <span class="string">"fromStation"</span>: <span class="string">"北京"</span>,
+                           <span class="string">"toStation"</span>: <span class="string">"上海"</span>}}}</code></pre>
+      </div>
+      <div>
+        <h4 style="color:#34d399; margin-bottom:10px;">👉 服务器 → 客户端</h4>
+        <pre><code><span class="comment">// 1. 初始化响应</span>
+{<span class="string">"jsonrpc"</span>: <span class="string">"2.0"</span>, <span class="string">"id"</span>: 1,
+ <span class="string">"result"</span>: {<span class="string">"protocolVersion"</span>: <span class="string">"2024-11-05"</span>,
+            <span class="string">"serverInfo"</span>: {<span class="string">"name"</span>: <span class="string">"mcp-server-12306"</span>}}}
+
+<span class="comment">// 2. 工具列表</span>
+{<span class="string">"jsonrpc"</span>: <span class="string">"2.0"</span>, <span class="string">"id"</span>: 2,
+ <span class="string">"result"</span>: {<span class="string">"tools"</span>: [
+   {<span class="string">"name"</span>: <span class="string">"get-tickets"</span>,
+    <span class="string">"inputSchema"</span>: {<span class="string">"properties"</span>: {
+      <span class="string">"date"</span>: {<span class="string">"type"</span>: <span class="string">"string"</span>},
+      <span class="string">"fromStation"</span>: {<span class="string">"type"</span>: <span class="string">"string"</span>},
+      <span class="string">"toStation"</span>: {<span class="string">"type"</span>: <span class="string">"string"</span>}}}}]}}
+
+<span class="comment">// 3. 工具结果</span>
+{<span class="string">"jsonrpc"</span>: <span class="string">"2.0"</span>, <span class="string">"id"</span>: 3,
+ <span class="string">"result"</span>: {<span class="string">"content"</span>: [
+   {<span class="string">"type"</span>: <span class="string">"text"</span>,
+    <span class="string">"text"</span>: <span class="string">"车次 G2, 09:00-13:30..."</span>}]}}</code></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== 架构总览 ==================== -->
+  <div class="card">
+    <h2>🏗️ 架构总览</h2>
+    <div class="mermaid-wrapper">
+      <div class="mermaid">
+graph LR
+    classDef user fill#1e3a5f,stroke:#60a5fa,color:#e0e0e0
+    classDef langgraph fill#5b21b6,stroke:#a78bfa,color:#e0e0e0
+    classDef mcp fill#9a3412,stroke:#fb923c,color:#e0e0e0
+    classDef external fill#374151,stroke:#9ca3af,color:#e0e0e0
+
+    USER["👤 用户<br/>命令行输入"]:::user --> AGENT["🧠 LangGraph Agent<br/>状态机 + 条件分支<br/>意图分析 → 路由 → 执行 → 响应"]:::langgraph
+
+    AGENT -->|"天气"| WEATHER["🌤️ 中国天气网<br/>内置 HTTP 调用<br/>无需 API Key"]:::external
+    AGENT -->|"车票"| MCP_CLIENT["📡 MCP Client<br/>JSON-RPC over stdio<br/>子进程管理"]:::mcp
+
+    MCP_CLIENT --> MCP_SERVER["🚄 mcp-server-12306<br/>Python 进程<br/>7 个工具"]:::external
+    MCP_SERVER --> API12306["🔗 12306.cn<br/>火车票数据"]:::external
+
+    AGENT -->|"格式化"| LLM["🤖 LLM<br/>通义千问 / GPT<br/>格式化回复"]:::external
+    LLM --> OUTPUT["💬 友好中文回复<br/>表情符号 + 表格 + 建议"]:::user
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#5b21b6',
+    primaryTextColor: '#e0e0e0',
+    primaryBorderColor: '#a78bfa',
+    lineColor: '#a78bfa',
+    secondaryColor: '#1e40af',
+    tertiaryColor: '#065f46',
+    fontSize: '14px',
+  },
+  flowchart: {
+    useMaxWidth: true,
+    htmlLabels: true,
+    curve: 'basis',
+  },
+});
+</script>
+
+</body>
+</html>

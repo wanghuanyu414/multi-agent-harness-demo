@@ -1,0 +1,18 @@
+# Secrets（含 API Key，禁止提交）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# 会话检查点数据库（运行时生成）
+checkpoints.db
+checkpoints.db-wal
+checkpoints.db-shm
+
+# IDE / 测试缓存
+.idea/
+.pytest_cache/

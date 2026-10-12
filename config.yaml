@@ -1,0 +1,130 @@
+# ============================================
+# 旅行助手 Agent 配置文件
+# ============================================
+
+# LLM 配置
+llm:
+  provider: openai           # LLM 提供商
+  model: ${OPENAI_MODEL:gpt-4o}  # 模型名称，从环境变量读取
+  api_key: ${OPENAI_API_KEY}      # API Key，从环境变量读取
+  base_url: ${OPENAI_BASE_URL:https://api.openai.com/v1}  # API 地址
+  temperature: 0.7                # 生成温度
+  max_tokens: 4096                # 最大 token 数
+
+# 护栏专用 LLM（独立于主模型）
+guardrail_llm:
+  provider: anthropic             # anthropic / openai
+  model: ${GUARDRAIL_MODEL:deepseek-v4-flash}   # 护栏模型名
+  api_key: ${ANTHROPIC_AUTH_TOKEN}             # 护栏 API Key
+  base_url: ${ANTHROPIC_BASE_URL:https://api.deepseek.com/anthropic}  # 护栏 API 地址
+  temperature: 0.0                # 生成温度
+  max_tokens: 512                 # 最大 token 数
+
+# MCP 服务器 + 内置工具配置
+mcp_servers:
+  - name: weather                 # 天气查询（内置工具，通过中国天气网）
+    description: 查询城市天气信息
+    type: builtin                 # 内置工具，不依赖外部进程
+    enabled: true
+
+  - name: "12306"                 # 火车票查询（MCP 服务器）
+    description: 查询 12306 火车票信息
+    command: mcp-server-12306   # 需安装 mcp-server-12306 包（Windows）
+    args: []
+    enabled: true
+    required: false                # 非必需，启动失败不阻塞主流程
+
+# Agent 配置
+agent:
+  name: 旅行助手
+  description: 支持天气查询和火车票查询的智能助手
+  multi_agent: true           # true 启用多 Agent（Supervisor + 专职 Worker），false 走单 Agent 流水线
+  memory_path: memory_store.json   # 长期记忆持久化文件路径
+
+  # 会话检查点（多轮对话持久化）
+  checkpoint:
+    backend: ${CHECKPOINT_BACKEND:redis}  # redis / sqlite / postgres / memory（环境变量可覆盖）
+    redis_url: ${REDIS_URL:redis://localhost:16379}  # redis 连接串（backend=redis 时使用）
+    path: checkpoints.db       # sqlite 文件路径（backend=sqlite 时使用）
+    # conn_string: postgresql://user:pass@host:5432/db   # postgres 连接串（backend=postgres 时必填）
+
+# ============================================
+# 上下文治理（长会话压缩摘要）—— 单/多 Agent 共用
+# ============================================
+context:
+  summarize:
+    enabled: true            # 是否启用长会话压缩
+    max_tokens: 6000         # 消息总 token 超过该预算时触发压缩
+    keep_recent: 4           # 压缩后保留最近 N 条原文（其余并入摘要）
+
+# ============================================
+# 驾驭工程 (Harness Agent) 配置
+# ============================================
+harness:
+  # 安全护栏
+  guardrails:
+    enabled: true
+    input:
+      enabled: true
+      mode: blocking              # "blocking" 拦截违规, "warning" 仅日志告警
+      checks:
+        pii: true                 # 手机号/身份证/邮箱检测
+        injection: true           # 提示注入检测（正则）
+        toxic: false              # 有害内容检测
+      use_llm: true               # LLM 语义化注入判定
+      on_llm_error: closed        # LLM 判定不可用时的策略：closed=按注入处理(fail-closed)，open=放行(fail-open)
+    output:
+      enabled: true
+      mode: warning
+      factual_check: true          # LLM 事实性校验（回复 vs 工具结果，仅天气/车票意图）
+      drift_check: false          # LLM 上下文漂移检测
+      on_llm_error: open          # 输出侧软违规判定失败策略：open=放行（默认），closed=按违规处理
+      checks:
+        pii_leak: true            # 回复中 PII 泄露检测（用户自有 PII 回显除外）
+        hallucination: true       # 幻觉标记检测
+        prompt_leak: true         # 系统提示词指纹泄露检测
+        inappropriate: false      # 不当内容检测
+
+  # 反思循环
+  reflection:
+    enabled: true
+    max_retries: 3
+    retry_on:
+      empty_result: true          # 空结果触发重试
+      tool_error: true            # 工具报错触发重试
+      low_quality: false          # LLM 质量评估
+
+  # 动态规划
+  planner:
+    enabled: true                 # 启用多步动态规划（含 CoT 推理）
+    max_steps: 3                  # 执行计划最大步数
+    fallback_to_static: true      # LLM 失败时回退到静态路由
+
+  # 可观测性
+  observability:
+    enabled: true
+    level: basic                  # "basic" 简洁模式, "full" JSON 详细模式
+    output: console               # "console", "json", "both"
+    color: true                   # 彩色控制台输出
+
+  # 人工审核（Human-in-the-loop）—— 单/多 Agent 共用
+  human_review:
+    enabled: true
+    intents: ["ticket"]           # 只审「车票」意图；["all"] 审核全部意图
+
+# ============================================
+# 请求限流（Web 层，按客户端 IP）
+# ============================================
+rate_limit:
+  enabled: true
+  max_requests: 30       # 每个 IP 在 window_seconds 内的最大请求数
+  window_seconds: 60     # 滑动窗口时长（秒）
+
+# ============================================
+# LangSmith 可观测性（SaaS）
+# ============================================
+langsmith:
+  enabled: ${LANGSMITH_ENABLED:true}      # 是否启用 LangSmith 追踪/评测
+  endpoint: ${LANGSMITH_ENDPOINT:https://api.smith.langchain.com}  # SaaS 服务地址
+  api_key: ${LANGSMITH_API_KEY:}            # 你的 LangSmith API Key（留空/占位符会在启动时告警）
+  project: ${LANGSMITH_PROJECT:travel-agent}             # trace / dataset 所属项目

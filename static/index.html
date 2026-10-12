@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>旅行助手</title>
+<style>
+:root {
+  --user-bubble: #1a73e8;
+  --assistant-bubble: #e8eaed;
+  --bg: #f5f5f5;
+  --header-bg: #1a56c4;
+  --text: #202124;
+  --text-light: #5f6368;
+  --warn: #f59e0b;
+  --block: #ef4444;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+body { display: flex; flex-direction: column; background: var(--bg); }
+
+header {
+  background: var(--header-bg); color: #fff; padding: 12px 20px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+header h1 { font-size: 18px; font-weight: 600; }
+header .status { font-size: 12px; display: flex; align-items: center; gap: 6px; }
+header .dot { width: 8px; height: 8px; border-radius: 50%; background: #4caf50; display: inline-block; }
+
+#chat { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.bubble { max-width: 80%; padding: 10px 14px; border-radius: 16px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+.bubble.user { align-self: flex-end; background: var(--user-bubble); color: #fff; border-bottom-right-radius: 4px; }
+.bubble.assistant { align-self: flex-start; background: var(--assistant-bubble); color: var(--text); border-bottom-left-radius: 4px; }
+.bubble .tag { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 10px; margin-bottom: 4px; background: rgba(255,255,255,0.3); }
+.bubble.assistant .tag { background: #d2e3fc; color: #1a56c4; }
+.bubble .guard-warn {
+  display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px;
+  background: #fef3c7; color: #92400e; margin-bottom: 4px; margin-left: 4px;
+}
+.bubble .trace-info {
+  font-size: 10px; color: var(--text-light); margin-top: 6px;
+  border-top: 1px solid #ddd; padding-top: 4px;
+}
+.bubble.typing { color: var(--text-light); font-style: italic; }
+.welcome { text-align: center; color: var(--text-light); margin-top: 40px; font-size: 14px; }
+.review-text { white-space: pre-wrap; margin-top: 4px; }
+.review-actions { margin-top: 10px; display: flex; gap: 8px; }
+.review-actions button {
+  padding: 6px 14px; border: none; border-radius: 16px;
+  font-size: 13px; color: #fff; cursor: pointer;
+}
+.review-actions button.approve { background: #16a34a; }
+.review-actions button.reject { background: #ef4444; }
+.review-actions button.edit { background: #f59e0b; }
+.review-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+.review-result { white-space: pre-wrap; margin-top: 10px; border-top: 1px dashed #ccc; padding-top: 8px; }
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+  display: flex; align-items: center; justify-content: center; z-index: 1000;
+}
+.modal-dialog {
+  background: #fff; border-radius: 12px; padding: 20px; width: 90%; max-width: 480px;
+  display: flex; flex-direction: column; gap: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+}
+.modal-title { font-size: 15px; font-weight: 600; color: var(--text); }
+.modal-textarea {
+  width: 100%; min-height: 160px; resize: vertical; padding: 10px;
+  border: 1px solid #ddd; border-radius: 8px; font-size: 14px;
+  font-family: inherit; line-height: 1.5; box-sizing: border-box;
+}
+.modal-buttons { display: flex; justify-content: flex-end; gap: 8px; }
+.modal-buttons button { padding: 8px 16px; border: none; border-radius: 8px; font-size: 13px; cursor: pointer; }
+.modal-cancel { background: #eee; color: var(--text); }
+.modal-confirm { background: #16a34a; color: #fff; }
+
+footer {
+  display: flex; gap: 8px; padding: 12px 16px; background: #fff;
+  border-top: 1px solid #ddd; align-items: center;
+}
+footer input { flex: 1; padding: 10px 14px; border: 1px solid #ddd; border-radius: 24px; font-size: 14px; outline: none; }
+footer input:focus { border-color: var(--header-bg); }
+footer button { padding: 10px 20px; border: none; border-radius: 24px; background: var(--header-bg); color: #fff; font-size: 14px; cursor: pointer; }
+footer button:disabled { opacity: 0.5; cursor: not-allowed; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🚄 旅行助手</h1>
+  <span class="status"><span class="dot"></span>在线</span>
+</header>
+
+<div id="chat">
+  <div class="welcome">👋 你好！可以问我天气、查火车票～</div>
+</div>
+
+<footer>
+  <input id="input" type="text" placeholder="输入消息…" autofocus>
+  <button id="send">发送</button>
+</footer>
+
+<script>
+const chat = document.getElementById('chat');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+
+let threadId = localStorage.getItem('thread_id');
+if (!threadId) {
+  threadId = crypto.randomUUID();
+  localStorage.setItem('thread_id', threadId);
+}
+
+function addBubble(text, role, tag, guardInfo, traceInfo) {
+  const div = document.createElement('div');
+  div.className = 'bubble ' + role;
+  if (tag) {
+    const t = document.createElement('span');
+    t.className = 'tag';
+    t.textContent = tag;
+    div.appendChild(t);
+  }
+  // 护栏告警
+  if (guardInfo && !guardInfo.passed) {
+    const g = document.createElement('span');
+    g.className = 'guard-warn';
+    const types = guardInfo.violations.map(v => v.type).join(', ');
+    g.textContent = '⚠ ' + (guardInfo.mode === 'blocking' ? '已拦截: ' : '检测到: ') + types;
+    div.appendChild(g);
+    div.appendChild(document.createElement('br'));
+  }
+  div.appendChild(document.createTextNode(text));
+  // trace 耗时
+  if (traceInfo) {
+    const tr = document.createElement('div');
+    tr.className = 'trace-info';
+    tr.textContent = '[Harness] ' + traceInfo.nodes + ' nodes, ' + traceInfo.total_ms + 'ms';
+    if (traceInfo.errors.length > 0) {
+      tr.textContent += ' | ERRORS: ' + traceInfo.errors.map(e => e.node).join(',');
+    }
+    div.appendChild(tr);
+  }
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function typingBubble() {
+  const div = document.createElement('div');
+  div.className = 'bubble assistant typing';
+  div.id = 'typing';
+  div.textContent = '思考中…';
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function removeTyping() {
+  const el = document.getElementById('typing');
+  if (el) el.remove();
+}
+
+async function submitReview(div, decision) {
+  const buttons = div.querySelectorAll('.review-actions button');
+  buttons.forEach(b => b.disabled = true);
+  try {
+    const res = await fetch('/api/review', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thread_id: threadId, ...decision }),
+    });
+    const data = await res.json();
+    const actions = div.querySelector('.review-actions');
+    if (actions) actions.remove();
+    const resultEl = document.createElement('div');
+    resultEl.className = 'review-result';
+    resultEl.textContent = data.response || '(空回复)';
+    div.appendChild(resultEl);
+    chat.scrollTop = chat.scrollHeight;
+  } catch (e) {
+    const err = document.createElement('div');
+    err.className = 'review-result';
+    err.textContent = '审核提交失败: ' + e.message;
+    div.appendChild(err);
+  }
+}
+
+function openEditModal(initialText) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+
+    const dialog = document.createElement('div');
+    dialog.className = 'modal-dialog';
+
+    const title = document.createElement('div');
+    title.className = 'modal-title';
+    title.textContent = '编辑回复';
+
+    const ta = document.createElement('textarea');
+    ta.className = 'modal-textarea';
+    ta.value = initialText || '';
+
+    const btns = document.createElement('div');
+    btns.className = 'modal-buttons';
+
+    const cancel = document.createElement('button');
+    cancel.className = 'modal-cancel';
+    cancel.textContent = '取消';
+    const confirm = document.createElement('button');
+    confirm.className = 'modal-confirm';
+    confirm.textContent = '通过修改';
+
+    btns.appendChild(cancel);
+    btns.appendChild(confirm);
+    dialog.appendChild(title);
+    dialog.appendChild(ta);
+    dialog.appendChild(btns);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    function close() { overlay.remove(); }
+    cancel.onclick = () => { close(); resolve(null); };
+    confirm.onclick = () => { const v = ta.value; close(); resolve(v); };
+    overlay.onclick = (e) => { if (e.target === overlay) { close(); resolve(null); } };
+    ta.focus();
+  });
+}
+
+function addReviewBubble(review) {
+  const div = document.createElement('div');
+  div.className = 'bubble assistant';
+  const tag = document.createElement('span');
+  tag.className = 'tag';
+  tag.textContent = '⚠ 人工审核';
+  div.appendChild(tag);
+
+  const text = document.createElement('div');
+  text.className = 'review-text';
+  text.textContent = review.response || '';
+  div.appendChild(text);
+
+  const actions = document.createElement('div');
+  actions.className = 'review-actions';
+
+  const approve = document.createElement('button');
+  approve.className = 'approve';
+  approve.textContent = '✓ 通过';
+  const reject = document.createElement('button');
+  reject.className = 'reject';
+  reject.textContent = '✕ 拒绝';
+  const edit = document.createElement('button');
+  edit.className = 'edit';
+  edit.textContent = '✎ 编辑';
+
+  actions.appendChild(approve);
+  actions.appendChild(reject);
+  actions.appendChild(edit);
+  div.appendChild(actions);
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+
+  approve.onclick = () => submitReview(div, { approve: true });
+  reject.onclick = () => submitReview(div, { approve: false });
+  edit.onclick = async () => {
+    const edited = await openEditModal(review.response || '');
+    if (edited === null) return;
+    submitReview(div, { approve: true, response: edited });
+  };
+}
+
+async function send() {
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  sendBtn.disabled = true;
+
+  addBubble(text, 'user');
+  typingBubble();
+
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, thread_id: threadId }),
+    });
+    const data = await res.json();
+    removeTyping();
+    if (data.human_review) {
+      addReviewBubble(data.human_review);
+    } else {
+      const intentLabel = data.intent === 'weather' ? '天气' : data.intent === 'ticket' ? '车票' : null;
+      addBubble(data.response, 'assistant', intentLabel, data.guardrail, data.trace);
+    }
+  } catch (e) {
+    removeTyping();
+    addBubble('网络错误: ' + e.message, 'assistant');
+  }
+  sendBtn.disabled = false;
+  input.focus();
+}
+
+sendBtn.addEventListener('click', send);
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+</script>
+
+</body>
+</html>
