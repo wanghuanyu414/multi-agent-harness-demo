@@ -266,7 +266,7 @@ def _latest_user_text(messages) -> str:
 
 
 async def _async_remember(memory, llm, user_text, content):
-    """后台记忆固化：提取事实写入长期记忆（不阻塞主流程）。"""
+    """后台记忆固化：提取事实写入长期记忆。"""
     try:
         facts = await extract_facts(llm, user_text, content)
         for f in facts:
