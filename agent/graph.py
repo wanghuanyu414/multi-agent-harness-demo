@@ -10,7 +10,6 @@ from .state import AgentState
 from .mcp_client import MCPClient
 from .nodes import (
     analyze_intent_node,
-    route_tool_node,
     execute_tool_node,
     generate_response_node,
 )
@@ -18,21 +17,21 @@ from .nodes import (
 logger = logging.getLogger(__name__)
 
 
-def _make_analyze_intent(llm: ChatOpenAI):
+def _make_analyze_intent(llm: ChatOpenAI, tools, tool_domain: dict):
     async def node(state: AgentState):
-        return await analyze_intent_node(state, llm)
+        return await analyze_intent_node(state, llm, tools, tool_domain)
     return node
 
 
-def _make_execute_tool(mcp_client: MCPClient):
+def _make_execute_tool(mcp_client: MCPClient, tool_server: dict, use_format_script: bool = True):
     async def node(state: AgentState):
-        return await execute_tool_node(state, mcp_client)
+        return await execute_tool_node(state, mcp_client, tool_server, use_format_script=use_format_script)
     return node
 
 
-def _make_generate_response(llm: ChatOpenAI, memory=None):
+def _make_generate_response(llm: ChatOpenAI, memory=None, review_intents=None):
     async def node(state: AgentState):
-        return await generate_response_node(state, llm, memory=memory)
+        return await generate_response_node(state, llm, memory=memory, review_intents=review_intents)
     return node
 
 
@@ -61,8 +60,10 @@ def build_graph(llm: ChatOpenAI, mcp_client: MCPClient,
     guardrail_llm = guardrail_llm or llm  # 未传入则回退主 LLM
     hc = (config or {}).get("harness", {})
     summarize_config = (config or {}).get("context", {}).get("summarize", {})
+    use_format_script = bool((config or {}).get("streaming", {}).get("ticket_format_script", False))
     human_review_config = hc.get("human_review", {})
     has_human_review = bool(human_review_config.get("enabled", False))
+    review_intents = set(human_review_config.get("intents", [])) if has_human_review else set()
 
     # ── 解析各层开关 ──────────────────────────────────────
     g_config = hc.get("guardrails", {})
@@ -99,7 +100,12 @@ def build_graph(llm: ChatOpenAI, mcp_client: MCPClient,
         guard_config = g_config.get("input", {})
 
         async def node(state: AgentState):
-            return await input_guardrail_node(state, guard_config, guardrail_llm)
+            result = await input_guardrail_node(state, guard_config, guardrail_llm)
+            gr = result.get("input_guardrail_result", {})
+            if gr.get("passed"):
+                # 通过时清空 error
+                result["error"] = ""
+            return result
         return node
 
     def _make_output_guardrail():
@@ -120,7 +126,7 @@ def build_graph(llm: ChatOpenAI, mcp_client: MCPClient,
         return node
 
     # ── 上下文压缩节点工厂（复用多 Agent 组件） ──────────────
-    def _make_summarize():
+    def _make_summarize(llm: ChatOpenAI):
         from agent.multiagent.supervisor import make_summarize_node
         return make_summarize_node(llm, summarize_config)
 
@@ -134,30 +140,32 @@ def build_graph(llm: ChatOpenAI, mcp_client: MCPClient,
         from agent.harness.param_normalize import build_param_normalize_graph
         return build_param_normalize_graph(llm)
 
+    # ── 构建工具列表 + 工具名→服务器映射（function calling 用） ──
+    from .multiagent.tools import build_specialist_tools
+    specialist_tools = build_specialist_tools(mcp_client)
+    all_tools = [t for domain_tools in specialist_tools.values() for t in domain_tools]
+    # 意图识别只暴露入口工具
+    entry_tools = {"get_weather", "query-tickets"}
+    tools = [t for t in all_tools if t.name in entry_tools]
+    # 工具名 → 意图领域，供 analyze_intent 做确定性映射（不靠字符串猜）
+    tool_domain = {t.name: domain for domain, ts in specialist_tools.items() for t in ts}
+    tool_server = {meta["name"]: meta["server"] for meta in mcp_client.list_tools()}
+
     # ── 构建图 ────────────────────────────────────────────
     workflow = StateGraph(AgentState)
 
     # 注册核心节点
-    workflow.add_node("summarize", _trace("summarize", _make_summarize()))
-    workflow.add_node("analyze_intent", _trace("analyze_intent", _make_analyze_intent(llm)))
-    workflow.add_node("normalize_params", _make_normalize())
-    workflow.add_node("execute_tool", _trace("execute_tool", _make_execute_tool(mcp_client)))
-    workflow.add_node("generate_response", _trace("generate_response", _make_generate_response(llm, memory)))
+    workflow.add_node("summarize", _trace("summarize", _make_summarize(guardrail_llm)))
+    workflow.add_node("analyze_intent", _trace("analyze_intent", _make_analyze_intent(guardrail_llm, tools, tool_domain)))
+    workflow.add_node("execute_tool", _trace("execute_tool", _make_execute_tool(mcp_client, tool_server, use_format_script)))
+    workflow.add_node("generate_response", _trace("generate_response", _make_generate_response(guardrail_llm, memory, review_intents)))
 
     # 注册 Harness 节点
     if has_input_guard:
         workflow.add_node("input_guardrail", _trace("input_guardrail", _make_input_guardrail()))
 
-    if has_planner:
-        workflow.add_node("plan_execution", _trace("plan_execution", _make_planner()))
-    else:
-        workflow.add_node("route_tool", _trace("route_tool", route_tool_node))
-
     if has_reflection:
         workflow.add_node("reflect", _trace("reflect", _make_reflect()))
-
-    if has_planner:
-        workflow.add_node("step_router", _step_router_node)
 
     if has_output_guard:
         workflow.add_node("output_guardrail", _trace("output_guardrail", _make_output_guardrail()))
@@ -167,53 +175,32 @@ def build_graph(llm: ChatOpenAI, mcp_client: MCPClient,
 
     # ── 边的连接顺序（自上而下） ─────────────────────────
 
-    # 1. START → summarize → analyze_intent → normalize_params
+    # 1. START → summarize → analyze_intent
     workflow.add_edge(START, "summarize")
     workflow.add_edge("summarize", "analyze_intent")
-    workflow.add_edge("analyze_intent", "normalize_params")
 
-    # 2. normalize_params → 下一步
-    #    有 input_guardrail 时先过护栏再分流；否则按意图分流
-    tool_target = "plan_execution" if has_planner else "route_tool"
+    # 2. analyze_intent → [input_guardrail] → 分流（有工具调用 → execute_tool，否则 → generate_response）
     if has_input_guard:
-        workflow.add_edge("normalize_params", "input_guardrail")
+        workflow.add_edge("analyze_intent", "input_guardrail")
         workflow.add_conditional_edges(
             "input_guardrail",
-            _make_guard_router(tool_target),
-            {tool_target: tool_target, "generate_response": "generate_response"},
+            _make_guard_router("execute_tool"),
+            {"execute_tool": "execute_tool", "generate_response": "generate_response"},
         )
     else:
         workflow.add_conditional_edges(
-            "normalize_params",
-            _make_intent_router(tool_target),
-            {"route_tool": tool_target, "generate_response": "generate_response"},
-        )
-
-    # 3. route_tool / plan_execution → 下一步
-    router_map = {"execute_tool": "execute_tool", "generate_response": "generate_response"}
-    workflow.add_conditional_edges(
-        tool_target,
-        _make_tool_router(),
-        router_map,
-    )
-
-    # 5. execute_tool → 下一步
-    #    多步规划：串行执行每一步（step_router 循环）
-    #    单步静态：反思重试（reflect）或直接生成回复
-    if has_planner:
-        workflow.add_edge("execute_tool", "step_router")
-        workflow.add_conditional_edges(
-            "step_router",
-            _make_step_router(),
+            "analyze_intent",
+            _make_tool_calls_router(),
             {"execute_tool": "execute_tool", "generate_response": "generate_response"},
         )
-    elif has_reflection:
+
+    # 3. execute_tool → 下一步（反思重试或直接生成回复）
+    if has_reflection:
         workflow.add_edge("execute_tool", "reflect")
-        reflect_map = {"execute_tool": "execute_tool", "generate_response": "generate_response"}
         workflow.add_conditional_edges(
             "reflect",
             _make_reflect_router(hc.get("reflection", {})),
-            reflect_map,
+            {"execute_tool": "execute_tool", "generate_response": "generate_response"},
         )
     else:
         workflow.add_edge("execute_tool", "generate_response")
@@ -229,7 +216,7 @@ def build_graph(llm: ChatOpenAI, mcp_client: MCPClient,
 
     # ── 编译 ──────────────────────────────────────────────
     checkpointer = checkpointer or InMemorySaver()
-    # 设置递归限制
+    # 设置递归限制避免反射死循环: max_retries*2(execute+reflect) + 10(基础开销)
     recursion_limit = hc.get("reflection", {}).get("max_retries", 3) * 2 + 10
     app = workflow.compile(checkpointer=checkpointer)
     app = app.with_config({"recursion_limit": recursion_limit})
@@ -244,38 +231,23 @@ def build_graph(llm: ChatOpenAI, mcp_client: MCPClient,
 # 条件路由函数（闭包捕获目标节点名）
 # ============================================================
 
-def _make_intent_router(tool_target: str):
-    """analyze_intent 之后的意图路由"""
-    def _route(state: AgentState) -> Literal["route_tool", "generate_response"]:
-        intent = state.get("intent", "chat")
-        if intent in ("weather", "ticket"):
-            return "route_tool"  # 映射到 tool_target（在 after_intent_map 中对应）
+def _make_tool_calls_router():
+    """normalize_params 之后：有工具调用 → execute_tool，否则 → generate_response"""
+    def _route(state: AgentState) -> str:
+        if state.get("tool_calls"):
+            return "execute_tool"
         return "generate_response"
     return _route
 
 
 def _make_guard_router(tool_target: str):
-    """input_guardrail 之后的护栏+意图路由"""
+    """input_guardrail 之后：护栏拦截或无线工具调用 → generate_response，否则 → execute_tool"""
     def _route(state: AgentState) -> str:
-        # 如果护栏拦截了，直接返回
         result = state.get("input_guardrail_result", {})
         if not result.get("passed") and result.get("mode") == "blocking":
             return "generate_response"
-        # 护栏通过，按意图分流
-        intent = state.get("intent", "chat")
-        if intent in ("weather", "ticket"):
-            return tool_target  # plan_execution 或 route_tool
-        return "generate_response"
-    return _route
-
-
-def _make_tool_router():
-    """route_tool / plan_execution 之后的工具路由"""
-    def _route(state: AgentState) -> Literal["execute_tool", "generate_response"]:
-        intent = state.get("intent", "chat")
-        error = state.get("error", "")
-        if intent in ("weather", "ticket") and not error:
-            return "execute_tool"
+        if state.get("tool_calls"):
+            return tool_target
         return "generate_response"
     return _route
 

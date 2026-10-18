@@ -174,7 +174,7 @@ async def _evaluate_quality(llm, mcp_result, intent: str, user_query: str) -> di
         mcp_result=json.dumps(mcp_result, ensure_ascii=False)[:2000],
     )
     try:
-        verdict = await judge_llm.with_structured_output(QualityVerdict).ainvoke([
+        verdict = await judge_llm.with_structured_output(QualityVerdict, method="function_calling").ainvoke([
             SystemMessage(content="你是工具结果质量评估员，判断结果是否满足用户请求。"),
             HumanMessage(content=prompt),
         ])
@@ -191,7 +191,6 @@ async def reflect_node(state: AgentState, config: dict, llm=None) -> dict[str, A
     Args:
         llm: 可选的 ChatOpenAI，用于 low_quality 质量评估；None 则跳过
     """
-    mcp_result = state.get("mcp_result", {})
     intent = state.get("intent", "chat")
     retry_count = state.get("retry_count", 0)
     max_retries = config.get("max_retries", state.get("max_retries", 3))
@@ -201,8 +200,19 @@ async def reflect_node(state: AgentState, config: dict, llm=None) -> dict[str, A
     if intent == "chat":
         return {"reflection_notes": "ok: 非工具意图，跳过反思"}
 
-    # 评估
-    evaluation = _evaluate_result(mcp_result, intent, config)
+    # 评估：function calling 多工具结果逐个评估，任一空/错误才重试；
+    # 无 tool_results 时回退旧单工具 mcp_result
+    tool_results = state.get("tool_results", [])
+    if tool_results:
+        evaluation = {"needs_retry": False, "reason": "结果满意"}
+        for tr in tool_results:
+            result = tr.get("result", {}) if isinstance(tr, dict) else tr
+            ev = _evaluate_result(result, intent, config)
+            if ev["needs_retry"]:
+                evaluation = ev
+                break
+    else:
+        evaluation = _evaluate_result(state.get("mcp_result", {}), intent, config)
 
     # 低质量评估：正则只查"报错/空结果"，这里补"结果错了/不匹配"的语义判断
     if (not evaluation["needs_retry"]

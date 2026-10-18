@@ -6,178 +6,149 @@ import random
 import time
 from typing import Any
 
+import httpx2
+from mcp import Client, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
+
 from .tool_errors import ToolCallError, classify_exception, NOT_FOUND, CONNECTION
 
 logger = logging.getLogger(__name__)
 
 
+def _tool_to_dict(tool) -> dict:
+    """官方 SDK 的 Tool 对象 → 现有 dict 格式（camelCase，兼容下游 tools.py）"""
+    return {
+        "name": tool.name,
+        "description": tool.description or "",
+        "inputSchema": tool.input_schema or {},
+    }
+
+
+def _call_result_to_dict(result) -> dict:
+    """官方 SDK 的 CallToolResult → dict，保持 {"content": [...], "isError": ...} 结构"""
+    content = []
+    for item in getattr(result, "content", None) or []:
+        if getattr(item, "type", None) == "text" or hasattr(item, "text"):
+            content.append({"type": "text", "text": getattr(item, "text", "")})
+        else:
+            # 图片 / 资源等非文本内容：尽量保留原始结构
+            try:
+                content.append(item.model_dump())
+            except Exception:
+                content.append({"type": getattr(item, "type", "unknown")})
+    return {"content": content, "isError": bool(getattr(result, "isError", False))}
+
+
 class MCPServer:
-    """单个 MCP 服务器连接
+    """单个 MCP 服务器连接（基于官方 mcp SDK，统一 stdio / Streamable HTTP 传输）"""
 
-    通过 stdio 与 MCP 服务器进程通信，使用 JSON-RPC 2.0 协议。
-    """
-
-    def __init__(self, name: str, command: str, args: list[str], timeout: float = 30.0):
-        """
-        Args:
-            name: 服务器名称（用于日志和标识）
-            command: 启动命令（如 npx / 可执行文件绝对路径）
-            args: 命令参数
-            timeout: 单次工具调用的响应超时（秒）
-        """
+    def __init__(self, name: str, config: dict):
         self.name = name
-        self.command = command
-        self.args = args
-        self.timeout = timeout
-        self.process: asyncio.subprocess.Process | None = None
-        self._request_id = 0
+        self.transport = str(config.get("transport", "stdio"))
+        self.command = config.get("command")
+        self.args = list(config.get("args", []) or [])
+        self.url = config.get("url")
+        self.timeout = float(config.get("timeout", 30.0))
+        self._client: Client | None = None
+        self._http_client: httpx2.AsyncClient | None = None
         self._tools: list[dict] = []
-        self._lock = asyncio.Lock()
+        self._alive = False
+        self._listen_task: asyncio.Task | None = None
+        self._on_tools_changed = None  # 工具列表变更回调（由 MCPClient 注入）
 
-    def is_alive(self) -> bool:
-        """进程是否存活（未退出）"""
-        return self.process is not None and self.process.returncode is None
+    def set_tools_changed_callback(self, callback) -> None:
+        """注入工具列表变更回调，供热更新时回写 MCPClient 的工具注册表"""
+        self._on_tools_changed = callback
+
+    def _build_transport(self):
+        if self.transport == "http":
+            if not self.url:
+                raise ValueError(f"[{self.name}] transport=http 缺少 url")
+            # headers/timeout 必须放 httpx2.AsyncClient（streamable_http_client 不接受这些参数）
+            self._http_client = httpx2.AsyncClient(
+                timeout=httpx2.Timeout(self.timeout, read=self.timeout),
+            )
+            return streamable_http_client(self.url, http_client=self._http_client)
+        if self.transport != "stdio":
+            logger.warning(f"[{self.name}] 未知 transport={self.transport}，回退 stdio")
+        if not self.command:
+            raise ValueError(f"[{self.name}] transport=stdio 缺少 command")
+        # 子进程默认 GBK 输出日志会乱码，强制 PYTHONIOENCODING=utf-8 让 stderr 用 UTF-8
+        return stdio_client(StdioServerParameters(
+            command=self.command,
+            args=self.args,
+            env={"PYTHONIOENCODING": "utf-8"},
+        ))
 
     async def start(self) -> None:
-        """启动 MCP 服务器进程并完成初始化握手"""
-        logger.info(f"[{self.name}] 正在启动 MCP 服务器: {self.command} {' '.join(self.args)}")
+        """建立连接、完成握手并拉取工具列表"""
+        logger.info(f"[{self.name}] 正在启动 MCP 服务器 (transport={self.transport})")
+        transport = self._build_transport()
+        self._client = Client(transport, read_timeout_seconds=self.timeout)
+        await self._client.__aenter__()
+        result = await self._client.list_tools()
+        self._tools = [_tool_to_dict(t) for t in result.tools]
+        self._alive = True
+        logger.info(
+            f"[{self.name}] 启动成功，注册 {len(self._tools)} 个工具: "
+            f"{[t['name'] for t in self._tools]}"
+        )
+        # 热更新订阅：服务器不支持 subscriptions/listen 时静默降级（靠 refresh_tools 兜底）
+        self._listen_task = asyncio.create_task(self._listen_loop())
+
+    async def _listen_loop(self) -> None:
+        """监听 tools/list_changed 通知，收到后刷新工具列表"""
         try:
-            # 用 exec 启动子进程，command 为可执行文件绝对路径
-            self.process = await asyncio.create_subprocess_exec(
-                self.command, *self.args,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            # 给进程一点时间启动，检查是否立即退出
-            await asyncio.sleep(0.5)
-            if self.process.returncode is not None:
-                stderr_data = await self.process.stderr.read() if self.process.stderr else b""
-                raise ConnectionError(
-                    f"[{self.name}] 进程立即退出 (code={self.process.returncode})。"
-                    f"stderr: {stderr_data.decode(errors='replace')[:500]}"
-                )
-            await self._initialize()
-            self._tools = await self._list_tools()
-            logger.info(
-                f"[{self.name}] 启动成功，注册 {len(self._tools)} 个工具: "
-                f"{[t.get('name') for t in self._tools]}"
-            )
+            async with self._client.listen(tools_list_changed=True) as sub:
+                async for _ in sub:
+                    logger.info(f"[{self.name}] 收到 tools/list_changed，刷新工具列表")
+                    await self.refresh_tools()
         except Exception as e:
-            logger.error(f"[{self.name}] 启动失败: {e}")
-            await self.close()
-            raise
+            logger.debug(f"[{self.name}] list_changed 订阅不可用（降级惰性刷新）: {e}")
 
-    async def _initialize(self) -> dict:
-        """MCP 初始化握手"""
-        result = await self._send_request("initialize", {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "travel-agent", "version": "1.0.0"},
-        })
-        # 发送 initialized 通知
-        await self._send_notification("notifications/initialized", {})
-        return result
-
-    async def _send_request(self, method: str, params: dict) -> dict:
-        """发送 JSON-RPC 请求并等待响应"""
-        async with self._lock:
-            self._request_id += 1
-            request = {
-                "jsonrpc": "2.0",
-                "id": self._request_id,
-                "method": method,
-                "params": params,
-            }
-            return await self._send_and_receive(request)
-
-    async def _send_notification(self, method: str, params: dict) -> None:
-        """发送 JSON-RPC 通知（无响应）"""
-        notification = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        }
-        async with self._lock:
-            await self._write(notification)
-
-    async def _send_and_receive(self, message: dict) -> dict:
-        """写入消息并读取响应"""
-        await self._write(message)
-        return await self._read_response()
-
-    async def _write(self, message: dict) -> None:
-        """写入 JSON 消息到进程 stdin"""
-        data = json.dumps(message, ensure_ascii=False) + "\n"
-        logger.debug(f"[{self.name}] → {data.strip()}")
-        assert self.process and self.process.stdin
-        self.process.stdin.write(data.encode())
-        await self.process.stdin.drain()
-
-    async def _read_response(self) -> dict:
-        """从进程 stdout 读取 JSON 响应（带超时；超时/断连抛明确异常）"""
-        assert self.process and self.process.stdout
-        try:
-            line = await asyncio.wait_for(self.process.stdout.readline(), timeout=self.timeout)
-        except asyncio.TimeoutError:
-            raise TimeoutError(f"[{self.name}] MCP 响应超时（{self.timeout}s）")
-        if not line:
-            # 进程可能已退出，检查 stderr
-            if self.process.stderr:
-                stderr_data = await self.process.stderr.read()
-                raise ConnectionError(
-                    f"[{self.name}] MCP 服务器已断开。stderr: {stderr_data.decode(errors='replace')}"
-                )
-            raise ConnectionError(f"[{self.name}] MCP 服务器已断开，无错误输出")
-        data = json.loads(line)
-        logger.debug(f"[{self.name}] ← {json.dumps(data, ensure_ascii=False)[:500]}")
-        if "error" in data:
-            raise RuntimeError(f"[{self.name}] JSON-RPC 错误: {data['error']}")
-        return data
-
-    async def _list_tools(self) -> list[dict]:
-        """获取服务器提供的工具列表"""
-        result = await self._send_request("tools/list", {})
-        return result.get("result", {}).get("tools", [])
+    async def refresh_tools(self) -> list[dict]:
+        """重新拉取工具列表（热更新核心方法），并回写 MCPClient 工具注册表"""
+        result = await self._client.list_tools()
+        self._tools = [_tool_to_dict(t) for t in result.tools]
+        if self._on_tools_changed:
+            self._on_tools_changed(self.name, self._tools)
+        return self._tools
 
     @property
     def tools(self) -> list[dict]:
         """已注册的工具列表"""
         return self._tools
 
+    def is_alive(self) -> bool:
+        """连接是否存活。进程中途退出导致的失活由 call_tool 异常 + 重试兜底"""
+        return self._alive
+
     async def call_tool(self, tool_name: str, arguments: dict) -> dict:
-        """调用指定工具
-
-        Args:
-            tool_name: 工具名称
-            arguments: 工具参数
-
-        Returns:
-            工具执行结果
-        """
+        """调用指定工具，返回 {"content": [...], "isError": ...} 结构"""
         logger.info(f"[{self.name}] 调用工具 {tool_name}({arguments})")
-        result = await self._send_request("tools/call", {
-            "name": tool_name,
-            "arguments": arguments,
-        })
-        content = result.get("result", {})
+        result = await self._client.call_tool(tool_name, arguments)
+        content = _call_result_to_dict(result)
         logger.debug(f"[{self.name}] 工具结果: {json.dumps(content, ensure_ascii=False)[:300]}")
         return content
 
     async def close(self) -> None:
-        """关闭 MCP 服务器连接"""
-        if self.process and self.process.returncode is None:
+        """关闭连接"""
+        if self._listen_task:
+            self._listen_task.cancel()
+            self._listen_task = None
+        if self._client:
             logger.info(f"[{self.name}] 正在关闭...")
             try:
-                self.process.terminate()
-                try:
-                    await asyncio.wait_for(self.process.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    self.process.kill()
-                    await self.process.wait()
-            except ProcessLookupError:
-                pass  # 进程已退出
-            logger.info(f"[{self.name}] 已关闭")
+                await self._client.__aexit__(None, None, None)
+            except Exception as e:
+                logger.debug(f"[{self.name}] 关闭异常（忽略）: {e}")
+            self._client = None
+        if self._http_client:
+            await self._http_client.aclose()
+            self._http_client = None
+        self._alive = False
+        logger.info(f"[{self.name}] 已关闭")
 
 
 class MCPClient:
@@ -200,6 +171,17 @@ class MCPClient:
         """工具名 -> 处理函数"""
         self._startup_errors: dict[str, str] = {}
         """服务器名 -> 启动失败原因"""
+        self._server_domains: dict[str, str] = {}
+        """服务器名 -> 领域归属（从 config 的 domain 字段读，供多 Agent 按领域分发工具）"""
+        for cfg in server_configs:
+            if not cfg.get("domain"):
+                continue
+            domain = str(cfg["domain"])
+            if cfg.get("type") == "builtin":
+                # 内置工具统一注册在 "builtin" server 名下，domain 也映射到 "builtin"
+                self._server_domains["builtin"] = domain
+            else:
+                self._server_domains[str(cfg.get("name"))] = domain
 
     async def start_all(self, max_retries: int = 3,
                         retry_delay: float = 2.0) -> None:
@@ -220,8 +202,8 @@ class MCPClient:
             cfg_retries = config.get("max_retries", max_retries)
             cfg_delay = config.get("retry_delay", retry_delay)
 
-            server = MCPServer(config["name"], config["command"], config["args"],
-                               timeout=float(config.get("timeout", 30.0)))
+            server = MCPServer(config["name"], config)
+            server.set_tools_changed_callback(self._on_server_tools_changed)
             started = False
             last_error = None
 
@@ -265,6 +247,17 @@ class MCPClient:
             self._builtin_handlers[name] = tool_def["handler"]
         logger.info(f"MCP 工具注册表: {list(self._tool_registry.keys())}")
 
+    def _on_server_tools_changed(self, server_name: str, tools: list[dict]) -> None:
+        """工具列表热更新回调：移除该 server 旧工具，注册新工具到 tool_registry"""
+        for tool_name, (srv, _) in list(self._tool_registry.items()):
+            if srv == server_name:
+                del self._tool_registry[tool_name]
+        for tool in tools:
+            self._tool_registry[tool["name"]] = (server_name, tool)
+        logger.info(
+            f"MCP 服务器 [{server_name}] 工具列表热更新: {[t['name'] for t in tools]}"
+        )
+
     def get_all_tools_description(self) -> str:
         """获取所有工具的描述文本（供 LLM 使用）"""
         lines = []
@@ -288,6 +281,7 @@ class MCPClient:
             out.append({
                 "name": tool_name,
                 "server": server_name,
+                "domain": self._server_domains.get(server_name, ""),
                 "description": schema.get("description", ""),
                 "inputSchema": schema.get("inputSchema", {}),
             })

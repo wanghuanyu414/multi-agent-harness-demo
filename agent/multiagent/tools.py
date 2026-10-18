@@ -55,10 +55,10 @@ def mcp_tool_to_langchain_tool(mcp_client, name: str, server: str, schema: dict)
             # 返回用户友好文案而非抛异常，让 worker 的 ReAct 稳定拿到可读信息去降级
             logger.warning("工具 %s 调用失败 [%s]: %s", name, e.code, e.detail)
             return e.user_message
-        except Exception as e:
+        except Exception as e:  # 兜底：任何异常都不裸抛给 agent 执行器
             logger.error("工具 %s 调用异常: %s", name, e, exc_info=True)
             return "工具调用失败，请稍后重试"
-        # 间接注入防护：替换为安全标记
+        # 间接注入防护：工具返回内容含注入指令时替换为安全标记
         from ..harness.guardrails import sanitize_tool_output
         result, _ = sanitize_tool_output(result)
         if isinstance(result, str):
@@ -73,25 +73,20 @@ def mcp_tool_to_langchain_tool(mcp_client, name: str, server: str, schema: dict)
     )
 
 
-# 服务器名 → 领域 分区映射（当前项目各只有 1 个工具，映射无歧义；
-# 如需扩展，可改为从 config.yaml 的 mcp_servers 读取 domain 字段）
-_SERVER_TO_DOMAIN = {
-    "builtin": "weather",   # 内置天气工具注册在 "builtin" 名下
-    "weather": "weather",
-    "12306": "ticket",
-}
-
-
 def build_specialist_tools(mcp_client) -> dict[str, list[StructuredTool]]:
-    """枚举 MCP 客户端工具，按领域返回 {domain: [tools]}"""
-    result: dict[str, list] = {"weather": [], "ticket": []}
+    """枚举 MCP 客户端工具，按领域返回 {domain: [tools]}。
+
+    领域归属优先取 config 的 domain 字段（MCPClient.list_tools 已透传）；
+    无 domain 时按工具名启发式兜底。
+    """
+    result: dict[str, list] = {}
     for meta in mcp_client.list_tools():
         server = meta["server"]
-        domain = _SERVER_TO_DOMAIN.get(server)
-        if domain is None:
+        domain = meta.get("domain") or ""
+        if not domain:
             n = meta["name"].lower()
             domain = "ticket" if any(k in n for k in ("ticket", "12306", "train")) else "weather"
         tool = mcp_tool_to_langchain_tool(mcp_client, meta["name"], server, meta)
-        result[domain].append(tool)
-        logger.info(f"工具 {meta['name']} [{server}] → {domain}_agent")
+        result.setdefault(domain, []).append(tool)
+        logger.info(f"工具 {meta['name']} [{server}] → {domain}")
     return result

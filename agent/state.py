@@ -20,6 +20,7 @@ class AgentState(TypedDict):
     """
     messages: Annotated[Sequence[BaseMessage], add_messages]
     intent: str
+    intents: list                  # 多意图集合（如 ["weather", "ticket"]）；intent 为其主意图（第一个）
     extracted_params: dict
     user_text: str                 # 最新用户消息原文（参数规范化子图日期兜底用）
     normalized_params: dict        # 参数规范化子图产出的干净参数
@@ -28,6 +29,8 @@ class AgentState(TypedDict):
     tool_name: str
     tool_args: dict
     mcp_result: dict
+    tool_calls: list                # function calling 产出的工具调用 [{"name", "args", "id"}]
+    tool_results: list              # 并行执行的工具结果 [{"tool_name", "result"}]
     final_response: str
     error: str
 

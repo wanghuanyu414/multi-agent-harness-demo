@@ -54,10 +54,36 @@ class RequestIdFilter(logging.Filter):
 # 配置加载
 # ============================================================
 
+def _coerce_scalar(value: str):
+    """把环境变量字符串还原为原生标量，保持与 yaml.safe_load 一致的类型语义。
+    """
+    v = value.strip()
+    low = v.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return value
+
+
 def _resolve_env(value: str) -> str:
     """解析 ${VAR:default} 格式的环境变量引用"""
     if not isinstance(value, str):
         return value
+
+    # 整个值就是一个 ${VAR:default} 占位符 → 结果还原为原生标量（bool/int/float/str）
+    if re.fullmatch(r"\$\{[^}]+\}", value.strip()):
+        var_expr = value.strip()[2:-1]
+        if ":" in var_expr:
+            var_name, default = var_expr.split(":", 1)
+            return _coerce_scalar(os.environ.get(var_name.strip(), default.strip()))
+        return _coerce_scalar(os.environ.get(var_expr, ""))
 
     def _replacer(match):
         var_expr = match[1]
@@ -113,7 +139,11 @@ def setup_logging(level: str = "INFO") -> None:
 
 
 def _build_guardrail_llm(config: dict, main_llm):
-    """构建护栏专用 LLM；未配置 API key 时回退复用主 LLM。"""
+    """构建护栏专用 LLM。
+
+    provider=anthropic 走 DeepSeek 的 Anthropic 兼容端点（复用 ANTHROPIC_AUTH_TOKEN）；
+    否则用 OpenAI 兼容端点。key 缺失时回退复用主 LLM，保证向后兼容。
+    """
     gc = config.get("guardrail_llm") or {}
     key = (gc.get("api_key") or "").strip()
     if not key or key.startswith("sk-your-") or key == "sk-...":
@@ -141,35 +171,74 @@ def _build_guardrail_llm(config: dict, main_llm):
         base_url=gc.get("base_url", "https://api.deepseek.com/v1"),
         temperature=temperature,
         max_tokens=max_tokens,
+        request_timeout=60,
         callbacks=[TokenUsageCallbackHandler()],
     )
 
 
+async def _prefetch_sandbox_image(image: str) -> None:
+    """后台预拉取沙箱镜像"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "pull", image,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+    except Exception as e:
+        logger.warning(f"沙箱镜像预拉取失败: {e}")
+
+
 async def init_system(config: dict):
     """初始化 LLM 和 MCP 客户端"""
-    # 配置校验
+    # 配置校验：fail-fast，避免占位符 key / 非法值在运行期静默失效
     validate_config(config)
 
-    # 初始化 LangSmith
+    # 必须在首次 LLM 调用前初始化 LangSmith（其环境变量读取带 lru_cache）
     init_langsmith(config.get("langsmith", {}))
+
+    # OpenTelemetry（标准 trace 出口；未启用时 no-op 零开销）
+    from agent.harness.otel import init_otel
+    init_otel(config.get("otel", {}))
+
+    # SKILL 脚本执行沙箱（可插拔后端：docker / subprocess / none）
+    from agent.harness.sandbox import init_sandbox
+    init_sandbox(config)
+    if config.get("sandbox", {}).get("backend") == "docker":
+        image = config.get("sandbox", {}).get("image", "python:3.11-alpine")
+        asyncio.create_task(_prefetch_sandbox_image(image))
 
     llm_config = config["llm"]
 
     # 检查 API Key
     api_key = llm_config.get("api_key", "")
     if not api_key or api_key == "sk-your-api-key-here":
-        print(f"{Fore.YELLOW}⚠️  未设置 OPENAI_API_KEY，请在 .env 文件中配置")
+        print(f"{Fore.YELLOW}⚠️  未设置 API Key，请在 .env 文件中配置")
         print(f"{Fore.YELLOW}   可以复制 .env.example 为 .env 并填入你的 API Key")
         sys.exit(1)
 
-    llm = ChatOpenAI(
-        model=llm_config.get("model", "gpt-4o"),
-        api_key=api_key,
-        base_url=llm_config.get("base_url", "https://api.openai.com/v1"),
-        temperature=llm_config.get("temperature", 0.7),
-        max_tokens=llm_config.get("max_tokens", 2048),
-        callbacks=[TokenUsageCallbackHandler()],
-    )
+    provider = str(llm_config.get("provider", "openai")).lower()
+    if provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        llm = ChatAnthropic(
+            model=llm_config.get("model", "deepseek-v4-pro"),
+            anthropic_api_key=api_key,
+            anthropic_api_url=llm_config.get("base_url", "https://api.deepseek.com/anthropic"),
+            temperature=llm_config.get("temperature", 0.7),
+            max_tokens=llm_config.get("max_tokens", 4096),
+            thinking={"type": "disabled"},
+            callbacks=[TokenUsageCallbackHandler()],
+        )
+    else:
+        llm = ChatOpenAI(
+            model=llm_config.get("model", "gpt-4o"),
+            api_key=api_key,
+            base_url=llm_config.get("base_url", "https://api.openai.com/v1"),
+            temperature=llm_config.get("temperature", 0.7),
+            max_tokens=llm_config.get("max_tokens", 2048),
+            request_timeout=60,
+            callbacks=[TokenUsageCallbackHandler()],
+        )
 
     # 护栏专用 LLM（未配置则回退主 LLM）
     guardrail_llm = _build_guardrail_llm(config, llm)
@@ -178,10 +247,10 @@ async def init_system(config: dict):
     mcp_client = MCPClient(config.get("mcp_servers", []), builtin_tools=BUILTIN_TOOLS)
     await mcp_client.start_all()
 
-    # 长期记忆
+    # 长期记忆（跨会话持久化，多 Agent 模式启用）
     memory = LongTermMemory(config.get("agent", {}).get("memory_path", "memory_store.json"))
 
-    # 会话检查点
+    # 会话检查点（持久化：sqlite 默认 / postgres 多进程 / memory 兜底）
     checkpointer, close_checkpointer = await build_checkpointer(config)
 
     # 构建工作流（单 Agent 或多 Agent，取决于配置开关）

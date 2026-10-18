@@ -19,7 +19,9 @@ async def build_checkpointer(config: dict):
             logger.warning("langgraph-checkpoint-redis 未安装，回退内存 checkpointer")
         else:
             redis_url = cp.get("redis_url", "redis://localhost:6379")
-            cm = AsyncRedisSaver.from_conn_string(redis_url)
+            ttl_minutes = int(cp.get("ttl_minutes", 0) or 0)
+            ttl = {"default_ttl": ttl_minutes} if ttl_minutes > 0 else None
+            cm = AsyncRedisSaver.from_conn_string(redis_url, ttl=ttl)
             saver = await cm.__aenter__()
             await saver.setup()
             logger.info("checkpointer: redis (%s)", redis_url)

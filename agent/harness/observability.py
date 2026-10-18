@@ -35,50 +35,58 @@ def trace_node(node_name: str, config: dict):
     """
     def decorator(func: Callable) -> Callable:
         async def wrapper(state: dict) -> dict[str, Any]:
-            trace_id = state.get("trace_id", "")
-            if not trace_id:
-                trace_id = uuid.uuid4().hex[:12]
+            from .otel import get_tracer
+            tracer = get_tracer()
+            with tracer.start_as_current_span(node_name) as otel_span:
+                trace_id = state.get("trace_id", "")
+                if not trace_id:
+                    trace_id = uuid.uuid4().hex[:12]
 
-            # 捕获输入 state key（非空值）
-            input_keys = [k for k in state.keys() if state.get(k) not in ("", 0, False, [], {}, None)]
+                # 捕获输入 state key（非空值）
+                input_keys = [k for k in state.keys() if state.get(k) not in ("", 0, False, [], {}, None)]
 
-            start = time.monotonic()
-            error = None
-            result: dict[str, Any] = {}
+                start = time.monotonic()
+                error = None
+                result: dict[str, Any] = {}
 
-            try:
-                raw = func(state)
-                # 支持同步和异步两种节点
-                import asyncio
-                if asyncio.iscoroutine(raw):
-                    result = await raw
-                else:
-                    result = raw
-            except Exception as e:
-                error = type(e).__name__
-                raise
-            finally:
-                duration_ms = (time.monotonic() - start) * 1000
-                MetricsCollector.get().record_node(node_name, duration_ms)
-                # 节点可能返回 Command（如 human_review 的 interrupt/resume），非 dict 时只发 span、不回写
-                is_dict = isinstance(result, dict)
-                span = {
-                    "trace_id": trace_id,
-                    "node": node_name,
-                    "duration_ms": round(duration_ms, 2),
-                    "input_state_keys": input_keys,
-                    "output_state_keys": sorted(result.keys()) if is_dict and result else [],
-                    "error": error,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-                _emit_span(span, config)
-                if is_dict:
-                    chain = list(state.get("span_chain", []))
-                    chain.append(span)
-                    result["span_chain"] = chain
-                    result["trace_id"] = trace_id
+                try:
+                    raw = func(state)
+                    # 支持同步和异步两种节点
+                    import asyncio
+                    if asyncio.iscoroutine(raw):
+                        result = await raw
+                    else:
+                        result = raw
+                except Exception as e:
+                    error = type(e).__name__
+                    otel_span.record_exception(e)
+                    raise
+                finally:
+                    duration_ms = (time.monotonic() - start) * 1000
+                    otel_span.set_attribute("node.name", node_name)
+                    otel_span.set_attribute("duration_ms", round(duration_ms, 2))
+                    if error:
+                        otel_span.set_attribute("error", True)
+                    MetricsCollector.get().record_node(node_name, duration_ms)
+                    # 节点可能返回 Command（如 human_review 的 interrupt/resume），非 dict 时只发 span、不回写
+                    is_dict = isinstance(result, dict)
+                    span = {
+                        "trace_id": trace_id,
+                        "node": node_name,
+                        "duration_ms": round(duration_ms, 2),
+                        "input_state_keys": input_keys,
+                        "output_state_keys": sorted(result.keys()) if is_dict and result else [],
+                        "error": error,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                    _emit_span(span, config)
+                    if is_dict:
+                        chain = list(state.get("span_chain", []))
+                        chain.append(span)
+                        result["span_chain"] = chain
+                        result["trace_id"] = trace_id
 
-            return result
+                return result
         return wrapper
     return decorator
 

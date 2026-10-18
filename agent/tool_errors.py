@@ -1,10 +1,10 @@
-"""工具调用统一错误模型 —— 失败分类与用户友好文案。
+"""工具调用统一错误模型 —— 生产级失败分类与用户友好文案
 
-把底层异常归类为 ToolCallError：
-- code: 错误码
-- retryable: 是否可重试
-- user_message: 面向用户的友好文案
-- detail: 内部细节
+把底层异常归类为 ToolCallError，供上层做差异化兜底：
+- code: 错误码，用于指标分桶与告警
+- retryable: 是否值得重试（决定 mcp_client 是否退避重试）
+- user_message: 面向用户的友好文案，可直接展示
+- detail: 内部细节，只进日志不进回复
 """
 from __future__ import annotations
 

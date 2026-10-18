@@ -4,47 +4,61 @@
 
 # LLM 配置
 llm:
-  provider: openai           # LLM 提供商
-  model: ${OPENAI_MODEL:gpt-4o}  # 模型名称，从环境变量读取
-  api_key: ${OPENAI_API_KEY}      # API Key，从环境变量读取
-  base_url: ${OPENAI_BASE_URL:https://api.openai.com/v1}  # API 地址
+  provider: openai           # DeepSeek OpenAI 兼容端点
+  model: ${OPENAI_MODEL:deepseek-v4-pro}  # 模型名称
+  api_key: ${ANTHROPIC_AUTH_TOKEN}          # API Key（sk- 开头的 DeepSeek key）
+  base_url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com/v1}  # API 地址
   temperature: 0.7                # 生成温度
   max_tokens: 4096                # 最大 token 数
 
-# 护栏专用 LLM（独立于主模型）
+# 护栏专用 LLM
 guardrail_llm:
-  provider: anthropic             # anthropic / openai
-  model: ${GUARDRAIL_MODEL:deepseek-v4-flash}   # 护栏模型名
-  api_key: ${ANTHROPIC_AUTH_TOKEN}             # 护栏 API Key
-  base_url: ${ANTHROPIC_BASE_URL:https://api.deepseek.com/anthropic}  # 护栏 API 地址
-  temperature: 0.0                # 生成温度
-  max_tokens: 512                 # 最大 token 数
+  provider: openai             # DeepSeek OpenAI 兼容端点
+  model: ${GUARDRAIL_MODEL:deepseek-chat}   # 护栏模型名
+  api_key: ${ANTHROPIC_AUTH_TOKEN}             # API Key
+  base_url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com/v1}  # 护栏 API 地址
+  temperature: 0.0
+  max_tokens: 512
 
 # MCP 服务器 + 内置工具配置
+# transport: stdio（本地子进程，默认）/ http（Streamable HTTP 远程服务器）
+# domain: 工具归属的领域（weather / ticket），供多 Agent 按领域分发工具
 mcp_servers:
   - name: weather                 # 天气查询（内置工具，通过中国天气网）
     description: 查询城市天气信息
     type: builtin                 # 内置工具，不依赖外部进程
+    domain: weather               # 领域归属
     enabled: true
 
   - name: "12306"                 # 火车票查询（MCP 服务器）
     description: 查询 12306 火车票信息
-    command: mcp-server-12306   # 需安装 mcp-server-12306 包（Windows）
+    transport: stdio              # stdio | http
+    command: D:/AI/travel_agent/.venv/Scripts/mcp-server-12306.exe
     args: []
+    domain: ticket                # 领域归属
     enabled: true
     required: false                # 非必需，启动失败不阻塞主流程
+
+  # 远程 HTTP MCP 服务器示例（Streamable HTTP 传输）
+  # - name: "remote-weather"
+  #   description: 远程天气查询
+  #   transport: http
+  #   url: http://localhost:8000/mcp
+  #   domain: weather
+  #   enabled: false
 
 # Agent 配置
 agent:
   name: 旅行助手
   description: 支持天气查询和火车票查询的智能助手
-  multi_agent: true           # true 启用多 Agent（Supervisor + 专职 Worker），false 走单 Agent 流水线
+  multi_agent: false           # true 启用多 Agent（Supervisor + 专职 Worker），false 走单 Agent 流水线
   memory_path: memory_store.json   # 长期记忆持久化文件路径
 
   # 会话检查点（多轮对话持久化）
   checkpoint:
     backend: ${CHECKPOINT_BACKEND:redis}  # redis / sqlite / postgres / memory（环境变量可覆盖）
-    redis_url: ${REDIS_URL:redis://localhost:16379}  # redis 连接串（backend=redis 时使用）
+    redis_url: ${REDIS_URL:redis://127.0.0.1:16379?socket_timeout=10&socket_connect_timeout=10}  # redis 连接串（backend=redis 时使用）
+    ttl_minutes: 1440           # checkpoint 过期时间（分钟），0 或留空 = 不过期；防止多轮对话无限膨胀
     path: checkpoints.db       # sqlite 文件路径（backend=sqlite 时使用）
     # conn_string: postgresql://user:pass@host:5432/db   # postgres 连接串（backend=postgres 时必填）
 
@@ -54,8 +68,14 @@ agent:
 context:
   summarize:
     enabled: true            # 是否启用长会话压缩
-    max_tokens: 6000         # 消息总 token 超过该预算时触发压缩
+    max_tokens: 6000         # 消息总 token 超过该预算时触发压缩（按 token，贴合真实窗口）
     keep_recent: 4           # 压缩后保留最近 N 条原文（其余并入摘要）
+
+# ============================================
+# 输出流式呈现
+# ============================================
+streaming:
+  ticket_format_script: true   # format_tickets.py 开关；默认开 → 完整输出全部车次（逐行流式）
 
 # ============================================
 # 驾驭工程 (Harness Agent) 配置
@@ -111,6 +131,20 @@ harness:
   human_review:
     enabled: true
     intents: ["ticket"]           # 只审「车票」意图；["all"] 审核全部意图
+#    intents: []           # 只审「车票」意图；["all"] 审核全部意图
+
+# ============================================
+# SKILL 脚本执行沙箱（隔离第三方 skill 脚本）
+# backend: docker（真隔离，需 Docker）/ subprocess（弱隔离，快）/ none（无沙箱，仅开发）
+# ============================================
+sandbox:
+  enabled: true                 # 是否启用沙箱
+  backend: docker               # docker / subprocess / none
+  image: python:3.11-alpine     # docker 镜像（backend=docker 时）
+  memory: 64m                   # 内存上限
+  cpus: 0.5                     # CPU 配额
+  pids_limit: 64                # 进程数上限
+  timeout: 30                   # 脚本执行超时（秒），需覆盖 Docker 首次冷启动开销
 
 # ============================================
 # 请求限流（Web 层，按客户端 IP）
@@ -124,7 +158,15 @@ rate_limit:
 # LangSmith 可观测性（SaaS）
 # ============================================
 langsmith:
-  enabled: ${LANGSMITH_ENABLED:true}      # 是否启用 LangSmith 追踪/评测
+  enabled: ${LANGSMITH_ENABLED:false}      # 是否启用 LangSmith 追踪/评测
   endpoint: ${LANGSMITH_ENDPOINT:https://api.smith.langchain.com}  # SaaS 服务地址
   api_key: ${LANGSMITH_API_KEY:}            # 你的 LangSmith API Key（留空/占位符会在启动时告警）
   project: ${LANGSMITH_PROJECT:travel-agent}             # trace / dataset 所属项目
+
+# ============================================
+# OpenTelemetry（标准 trace 出口，可接 Jaeger/Tempo/Prometheus）
+# ============================================
+otel:
+  enabled: ${OTEL_ENABLED:false}            # 关闭时用 no-op tracer（零开销）
+  service_name: travel-agent
+  endpoint: ${OTEL_ENDPOINT:}               # OTLP HTTP endpoint（如 http://localhost:4318/v1/traces）；留空用 console exporter

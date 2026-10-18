@@ -8,8 +8,8 @@ from langchain_openai import ChatOpenAI
 
 from .state import MultiAgentState
 from .tools import build_specialist_tools
-from .skills import SKILLS, build_skill_agent
-from .supervisor import make_supervisor_node, make_agent_node, make_summarize_node
+from .skills import SKILLS
+from .supervisor import make_supervisor_node, make_agent_node, make_summarize_node, make_join_node
 from .human_review import make_human_review_node
 
 logger = logging.getLogger(__name__)
@@ -68,20 +68,28 @@ def build_multi_agent_graph(llm: ChatOpenAI, mcp_client, config: dict | None = N
     # 人工审核（Human-in-the-loop）配置
     human_review_config = harness.get("human_review", {})
     human_review_enabled = bool(human_review_config.get("enabled", False))
+    review_intents = set(human_review_config.get("intents", [])) if human_review_enabled else set()
+
+    # 车票格式化脚本开关（默认关 → LLM 流式格式化）
+    use_format_script = bool(config.get("streaming", {}).get("ticket_format_script", False))
 
     # 护栏配置
     guard_config = harness.get("guardrails", {})
     has_input_guard = bool(guard_config.get("enabled", False)) and bool(guard_config.get("input", {}).get("enabled", True))
     has_output_guard = bool(guard_config.get("enabled", False)) and bool(guard_config.get("output", {}).get("enabled", True))
 
+    # 可观测性配置（节点级 span 追踪）
+    obs_config = harness.get("observability", {})
+    has_obs = bool(obs_config.get("enabled", False))
+
     # 各专职 Agent 的工具（按领域分区）
     specialist_tools = build_specialist_tools(mcp_client)
 
-    # Supervisor 用温度 0 的 LLM
+    # Supervisor 路由用独立模型
     try:
-        supervisor_llm = llm.model_copy(update={"temperature": 0.0, "max_tokens": 4096})
+        supervisor_llm = guardrail_llm.model_copy(update={"temperature": 0.0, "max_tokens": 4096})
     except Exception:
-        supervisor_llm = llm
+        supervisor_llm = guardrail_llm
 
     # 聚合后的后处理链：output_guardrail → human_review → END
     finish_target = "output_guardrail" if has_output_guard else ("human_review" if human_review_enabled else END)
@@ -89,10 +97,13 @@ def build_multi_agent_graph(llm: ChatOpenAI, mcp_client, config: dict | None = N
 
     workflow = StateGraph(MultiAgentState)
 
-    # LangSmith 节点追踪（多 Agent 侧原本无 trace_node，这里补齐云端 span）
+    # 节点追踪：harness trace_node（本地 span 耗时）+ LangSmith（云端 span）
     from agent.langsmith_client import is_enabled as _ls_enabled, traceable_node as _ls_trace
 
     def _ls_wrap(name, fn):
+        if has_obs:
+            from agent.harness.observability import trace_node
+            fn = trace_node(name, obs_config)(fn)
         return _ls_trace(name)(fn) if _ls_enabled() else fn
 
     if has_input_guard:
@@ -102,16 +113,30 @@ def build_multi_agent_graph(llm: ChatOpenAI, mcp_client, config: dict | None = N
     workflow.add_node("summarize", _ls_wrap("summarize", make_summarize_node(llm, summarize_config)))
     workflow.add_node("supervisor", _ls_wrap("supervisor", make_supervisor_node(supervisor_llm, SKILLS, memory=memory, finish_target=finish_target)))
 
+    # 并行派发路由：supervisor 决策后 fan-out 到多个 Worker
+    agent_to_intent = {s.name: s.intent for s in SKILLS}
+
+    def route_to_workers(state):
+        from langgraph.types import Send
+        agents = state.get("agents_to_dispatch", [])
+        return [
+            Send(a, {**state, "next": a, "intent": agent_to_intent.get(a, "chat")})
+            for a in agents
+        ]
+
     # 从技能注册表循环构建专职 Agent 节点
     for skill in SKILLS:
         tools = skill.collect_tools(specialist_tools)
-        agent = build_skill_agent(llm, skill, tools)
-        workflow.add_node(skill.name, _ls_wrap(skill.name, make_agent_node(agent, skill.name, memory=memory, memory_llm=llm)))
+        workflow.add_node(skill.name, _ls_wrap(skill.name, make_agent_node(llm, tools, skill, memory=memory, memory_llm=llm, review_intents=review_intents, agent_to_intent=agent_to_intent, use_format_script=use_format_script)))
+
+    # 聚合节点：并行 Worker 完成后汇聚结果（fan-in）
+    agent_label = {s.name: s.label for s in SKILLS}
+    workflow.add_node("join", _ls_wrap("join", make_join_node(agent_label, finish_target)))
 
     if has_output_guard:
         workflow.add_node("output_guardrail", _ls_wrap("output_guardrail", _make_output_guardrail(guard_config.get("output", {}), guard_next, guardrail_llm)))
     if human_review_enabled:
-        workflow.add_node("human_review", _ls_wrap("human_review", make_human_review_node(human_review_config)))
+        workflow.add_node("human_review", _ls_wrap("human_review", make_human_review_node(human_review_config, agent_to_intent)))
 
     # 控制流：START → input_guardrail（或 summarize）→ summarize → supervisor，
     # 其余由 Command(goto=...) 决定
@@ -120,6 +145,7 @@ def build_multi_agent_graph(llm: ChatOpenAI, mcp_client, config: dict | None = N
     else:
         workflow.add_edge(START, "summarize")
     workflow.add_edge("summarize", "supervisor")
+    workflow.add_conditional_edges("supervisor", route_to_workers)
 
     checkpointer = checkpointer or InMemorySaver()
     app = workflow.compile(checkpointer=checkpointer)

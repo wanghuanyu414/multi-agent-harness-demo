@@ -1,6 +1,6 @@
 """单智能体图端到端集成测试（Fake LLM + Fake MCP，无网络无 key）。
 
-验证 normalize_params 子图在父图中的接线：意图 → 子图规范化 → 工具参数 → 回复。
+验证 function calling 流程。
 """
 import asyncio
 
@@ -10,13 +10,15 @@ from agent.graph import build_graph
 
 
 class FakeLLM:
+    def bind_tools(self, tools):
+        return self
+
     async def ainvoke(self, messages, **kwargs):
-        sys = messages[0].content if messages else ""
-        if "意图分析器" in sys:
-            return AIMessage(
-                content='{"intent":"weather","city":"beijing","from_city":null,"to_city":null,"date":null}'
-            )
-        return AIMessage(content="北京今天晴，20℃，适合出行。")
+        # 模拟 function calling：返回天气工具调用
+        return AIMessage(
+            content="",
+            tool_calls=[{"name": "get_weather", "args": {"city": "北京"}, "id": "call1"}],
+        )
 
 
 class FakeMCP:
@@ -33,7 +35,12 @@ class FakeMCP:
         return "get_weather: 查询天气"
 
     def list_tools(self):
-        return []
+        return [
+            {"name": "get_weather", "server": "builtin", "description": "查询天气",
+             "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}},
+            {"name": "query-tickets", "server": "12306", "description": "查询车票",
+             "inputSchema": {"type": "object", "properties": {"from_station": {"type": "string"}, "to_station": {"type": "string"}, "date": {"type": "string"}}, "required": ["from_station", "to_station", "date"]}},
+        ]
 
     def unhealthy_servers(self):
         return []
@@ -55,7 +62,7 @@ def _config():
     }
 
 
-def test_single_agent_weather_normalization():
+def test_single_agent_weather_function_calling():
     app = build_graph(FakeLLM(), FakeMCP(), config=_config())
 
     async def run():
@@ -65,21 +72,19 @@ def test_single_agent_weather_normalization():
         )
 
     result = asyncio.run(run())
-    # 子图把英文 city "beijing" 规范化为 "北京"
-    assert result.get("normalized_params", {}).get("city") == "北京"
-    assert result.get("tool_args") == {"city": "北京"}
+    # function calling 产出工具调用，并行执行后汇总
+    assert result.get("tool_calls"), "应有工具调用"
+    assert result.get("tool_results"), "应有工具结果"
     assert "晴" in result.get("final_response", "")
 
 
-def test_single_agent_ticket_missing_date_routes_to_error():
+def test_single_agent_ticket_function_calling():
     class TicketLLM(FakeLLM):
         async def ainvoke(self, messages, **kwargs):
-            sys = messages[0].content if messages else ""
-            if "意图分析器" in sys:
-                return AIMessage(
-                    content='{"intent":"ticket","city":null,"from_city":"上海","to_city":"北京","date":null}'
-                )
-            return AIMessage(content="")
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "query-tickets", "args": {"from_station": "上海", "to_station": "北京", "date": "2026-10-17"}, "id": "call1"}],
+            )
 
     app = build_graph(TicketLLM(), FakeMCP(), config=_config())
 
@@ -90,5 +95,6 @@ def test_single_agent_ticket_missing_date_routes_to_error():
         )
 
     result = asyncio.run(run())
-    # 缺日期 → 子图设 error → 主图 tool_router 路由到 generate_response 返回错误提示
-    assert "出发日期" in result.get("final_response", "")
+    assert result.get("tool_calls"), "应有工具调用"
+    assert result.get("tool_results"), "应有工具结果"
+    assert "晴" in result.get("final_response", "")

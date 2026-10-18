@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 _REJECT_FALLBACK = "抱歉，该回复未通过人工审核，已被取消。"
 
 
-def make_human_review_node(config: dict):
+def make_human_review_node(config: dict, agent_to_intent: dict | None = None):
     """构造人工审核节点。
 
     用 LangGraph 的 interrupt() 在最终回复返回用户前挂起，等待人工 approve / edit / reject。
@@ -27,9 +27,22 @@ def make_human_review_node(config: dict):
 
     async def human_review_node(state) -> Command:
         intent = state.get("intent", "chat")
+        state_intents = state.get("intents") or [intent]  # 单 Agent 多意图集合
         response = state.get("final_response", "")
 
-        needs_review = enabled and (intents == ["all"] or intent in intents)
+        if agent_to_intent:
+            dispatched_intents = {
+                agent_to_intent.get(a) for a in state.get("agents_to_dispatch", [])
+            }
+            dispatched_intents.discard(None)
+            needs_review = enabled and (
+                intents == ["all"] or bool(dispatched_intents & set(intents))
+            )
+        else:
+            needs_review = enabled and (
+                intents == ["all"] or any(i in intents for i in state_intents)
+            )
+
         if not needs_review:
             return Command(update={"human_review": {"status": "skipped", "intent": intent}}, goto=END)
 

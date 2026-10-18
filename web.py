@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """旅行助手 Web 服务 —— 最小改动，复用 init_system()"""
+import asyncio
+import json
 import logging
 import os
 import sys
@@ -10,7 +12,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
@@ -69,6 +71,12 @@ def _build_chat_response(result: dict) -> ChatResponse:
     if span_chain:
         from agent.harness.observability import emit_span_chain_summary
         emit_span_chain_summary(span_chain, color=True)
+
+    agent_trace = result.get("agent_trace") or []
+    if agent_trace:
+        logger.info("[多Agent] %s", " → ".join(agent_trace))
+    if result.get("plan_reasoning"):
+        logger.info("[推理] %s", result["plan_reasoning"])
 
     guard_result = result.get("input_guardrail_result") or result.get("output_guardrail_result")
     guard_info = None
@@ -171,37 +179,105 @@ def create_app() -> FastAPI:
 
     @app.post("/api/chat", response_model=ChatResponse)
     async def chat(req: ChatRequest, request: Request):
-        # 未传 thread_id 时生成独立会话
+        # 客户端未传 thread_id 时生成独立会话
         tid = req.thread_id or str(uuid.uuid4())
-        try:
-            result = await request.app.state.graph.ainvoke(
-                {"messages": [HumanMessage(content=req.message)]},
-                {"configurable": {"thread_id": tid}},
-            )
+        from agent.metrics import start_request_tokens, get_request_tokens
+        from agent.harness.otel import get_tracer
+        start_request_tokens()
+        tracer = get_tracer()
+        with tracer.start_as_current_span("chat") as root_span:
+            root_span.set_attribute("thread_id", tid)
+            try:
+                result = await request.app.state.graph.ainvoke(
+                    {"messages": [HumanMessage(content=req.message)]},
+                    {"configurable": {"thread_id": tid}},
+                )
 
-            # 人工审核中断：返回待审信息，等待前端提交审核决策后 resume
-            interrupts = result.get("__interrupt__")
-            if interrupts:
-                payload = interrupts[0].value if interrupts else {}
-                if isinstance(payload, dict) and payload.get("type") == "human_review":
-                    return ChatResponse(
-                        response="",
-                        thread_id=tid,
-                        intent=result.get("intent"),
-                        human_review={
-                            "intent": payload.get("intent"),
-                            "response": payload.get("response"),
-                        },
-                    )
-                logger.warning(f"未知中断类型，返回提示: {payload}")
-                return ChatResponse(response="系统已暂停等待人工处理，但无法识别中断类型。", thread_id=tid)
+                # 人工审核中断：返回待审信息，等待前端提交审核决策后 resume
+                interrupts = result.get("__interrupt__")
+                if interrupts:
+                    payload = interrupts[0].value if interrupts else {}
+                    if isinstance(payload, dict) and payload.get("type") == "human_review":
+                        return ChatResponse(
+                            response="",
+                            thread_id=tid,
+                            intent=result.get("intent"),
+                            human_review={
+                                "intent": payload.get("intent"),
+                                "response": payload.get("response"),
+                            },
+                        )
+                    logger.warning(f"未知中断类型，返回提示: {payload}")
+                    return ChatResponse(response="系统已暂停等待人工处理，但无法识别中断类型。", thread_id=tid)
 
-            resp = _build_chat_response(result)
-            resp.thread_id = tid
-            return resp
-        except Exception:
-            logger.exception("Chat 处理失败 thread_id=%s", tid)
-            return JSONResponse(status_code=500, content={"detail": "服务器内部错误，请稍后重试"})
+                resp = _build_chat_response(result)
+                resp.thread_id = tid
+                tok = get_request_tokens()
+                _in, _out = tok["input"], tok["output"]
+                if _in or _out:
+                    logger.info("[token] 本次请求 input=%d output=%d total=%d", _in, _out, _in + _out)
+                return resp
+            except Exception:
+                logger.exception("Chat 处理失败 thread_id=%s", tid)
+                return JSONResponse(status_code=500, content={"detail": "服务器内部错误，请稍后重试"})
+
+    @app.post("/api/chat/stream")
+    async def chat_stream(req: ChatRequest, request: Request):
+        tid = req.thread_id or str(uuid.uuid4())
+        from agent.metrics import start_request_tokens, set_stream_queue
+        start_request_tokens()
+        q = asyncio.Queue()
+        set_stream_queue(q)
+
+        async def run_graph():
+            try:
+                result = await request.app.state.graph.ainvoke(
+                    {"messages": [HumanMessage(content=req.message)]},
+                    {"configurable": {"thread_id": tid}},
+                )
+                # 人工审核中断：需要审核的意图不走流式，把待审信息发给前端展示审核气泡
+                interrupts = result.get("__interrupt__") if isinstance(result, dict) else None
+                if interrupts:
+                    payload = interrupts[0].value if interrupts else {}
+                    if isinstance(payload, dict) and payload.get("type") == "human_review":
+                        await q.put(("__review__", json.dumps(payload, ensure_ascii=False)))
+                else:
+                    # 非审核路径：把最终回复通过 __final__ 兜底发出（护栏拦截/非流式回复时，
+                    # 前端没有流式 token 也没有审核气泡，否则会误显示成「空回复」）
+                    final = result.get("final_response", "") if isinstance(result, dict) else ""
+                    if final:
+                        await q.put(("__final__", final))
+            except Exception:
+                logger.exception("流式处理失败 thread_id=%s", tid)
+            finally:
+                await q.put(None)  # 结束标记
+
+        async def event_stream():
+            task = asyncio.create_task(run_graph())
+            try:
+                while True:
+                    item = await q.get()
+                    if item is None:
+                        break
+                    node, token = item
+                    if node == "__blocked__":
+                        yield "data: [BLOCKED]\n\n"
+                        continue
+                    if node == "__review__":
+                        yield f"data: [REVIEW:{token}]\n\n"
+                        continue
+                    if node == "__final__":
+                        yield f"data: [FINAL:{json.dumps(token, ensure_ascii=False)}]\n\n"
+                        continue
+                    yield f"data: {json.dumps({'node': node, 'content': token}, ensure_ascii=False)}\n\n"
+            except Exception:
+                logger.exception("流式读取失败")
+                yield "data: [ERROR]\n\n"
+            finally:
+                await task
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     @app.post("/api/review", response_model=ChatResponse)
     async def review(req: ReviewRequest, request: Request):
@@ -237,7 +313,7 @@ if __name__ == "__main__":
     import uvicorn
     import asyncio
     app = create_app()
-    port = int(os.environ.get("PORT", "8080"))
+    port = int(os.environ.get("PORT", "8098"))
     config = uvicorn.Config(app, host="127.0.0.1", port=port)
     server = uvicorn.Server(config)
     try:

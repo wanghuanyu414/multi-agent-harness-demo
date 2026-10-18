@@ -5,6 +5,7 @@
 - MetricsCollector：进程内单例，收集节点延迟、工具调用成功率/耗时/token、累计 token 用量
 - percentiles：p50/p95/p99 聚合
 """
+import contextvars
 import logging
 import re
 import threading
@@ -21,12 +22,12 @@ except Exception:
 
 try:
     from langchain_core.callbacks import BaseCallbackHandler
-except Exception:  # 无 langchain 时退化
+except Exception:  # 无 langchain 时退化，避免硬依赖
     BaseCallbackHandler = object
 
 try:
     from langchain.agents.middleware import AgentMiddleware
-except Exception:  # 无 langchain 1.x 时退化
+except Exception:  # 无 langchain 1.x 时退化，避免硬依赖
     AgentMiddleware = object
 
 _CJK_RE = re.compile(r"[一-鿿]")
@@ -153,6 +154,43 @@ class MetricsCollector:
             return dict(self.tokens)
 
 
+# 请求级 token 追踪（contextvars 隔离并发请求，避免全局累计被并发互相污染）
+_request_tokens: contextvars.ContextVar = contextvars.ContextVar("request_tokens", default=None)
+
+
+def start_request_tokens() -> None:
+    """请求开始：初始化当前请求（context）的 token 计数。"""
+    _request_tokens.set({"input": 0, "output": 0})
+
+
+def add_request_tokens(input_tokens: int = 0, output_tokens: int = 0) -> None:
+    """在请求级上下文累加 token（并发安全，仅影响当前请求 context）。"""
+    tok = _request_tokens.get()
+    if tok is not None:
+        tok["input"] += input_tokens
+        tok["output"] += output_tokens
+
+
+def get_request_tokens() -> dict:
+    """请求结束：返回本次请求的 token 用量（input/output）。"""
+    tok = _request_tokens.get()
+    return dict(tok) if tok else {"input": 0, "output": 0}
+
+
+# 请求级 token 流式队列（contextvars，Worker 流式生成时写入，web 层读取）
+_stream_queue: contextvars.ContextVar = contextvars.ContextVar("stream_queue", default=None)
+
+
+def set_stream_queue(q) -> None:
+    """设置当前请求的 token 流式队列。"""
+    _stream_queue.set(q)
+
+
+def get_stream_queue():
+    """返回当前请求的 token 流式队列（未设置时为 None）。"""
+    return _stream_queue.get()
+
+
 class TokenUsageCallbackHandler(BaseCallbackHandler):
     """LLM 回调：捕获每次调用的真实 token 用量（usage_metadata），写入 MetricsCollector。
 
@@ -186,6 +224,7 @@ class TokenUsageCallbackHandler(BaseCallbackHandler):
 
         if input_tokens or output_tokens:
             self.collector.add_tokens(input_tokens, output_tokens)
+            add_request_tokens(input_tokens, output_tokens)
             self.calls += 1
 
 

@@ -226,3 +226,4 @@ checkpoints.db-shm
 
 # IDE
 .idea/
+.codebuddy/

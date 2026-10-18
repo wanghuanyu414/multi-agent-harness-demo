@@ -276,18 +276,84 @@ async function send() {
   typingBubble();
 
   try {
-    const res = await fetch('/api/chat', {
+    const res = await fetch('/api/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: text, thread_id: threadId }),
     });
-    const data = await res.json();
+    if (!res.ok || !res.body) {
+      throw new Error('HTTP ' + res.status);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
     removeTyping();
-    if (data.human_review) {
-      addReviewBubble(data.human_review);
-    } else {
-      const intentLabel = data.intent === 'weather' ? '天气' : data.intent === 'ticket' ? '车票' : null;
-      addBubble(data.response, 'assistant', intentLabel, data.guardrail, data.trace);
+    const divs = {};  // node -> 气泡，多 Worker 并行时各自独立显示
+    let reviewShown = false;  // 是否已展示人工审核气泡（避免误判空回复）
+    let finalShown = false;   // 是否已通过 [FINAL:] 兜底展示（避免再叠加空回复）
+    const nodeTag = { weather_agent: '🌤️ 天气', ticket_agent: '🚄 车票', chat_agent: '💬 对话' };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split('\n\n');
+      buffer = events.pop();
+      for (const evt of events) {
+        if (!evt.startsWith('data: ')) continue;
+        const payload = evt.slice(6);
+        if (payload === '[DONE]' || payload === '[ERROR]') continue;
+        if (payload === '[BLOCKED]') {
+          // 内容被护栏拦截，撤回已显示的回复
+          for (const k in divs) {
+            divs[k].textContent = '⚠️ 内容已按安全策略拦截';
+          }
+          continue;
+        }
+        if (payload.startsWith('[REVIEW:')) {
+          // 人工审核中断：展示审核气泡（通过/拒绝/编辑），经 /api/review 恢复
+          try {
+            const review = JSON.parse(payload.slice(8, -1));
+            addReviewBubble(review);
+            reviewShown = true;
+          } catch (e) {}
+          continue;
+        }
+        if (payload.startsWith('[FINAL:')) {
+          // 非审核路径的最终回复兜底：仅在没有流式内容时展示（有流式则忽略避免重复）
+          try {
+            const finalText = JSON.parse(payload.slice(7, -1));
+            if (finalText && Object.keys(divs).length === 0) {
+              addBubble(finalText, 'assistant');
+              finalShown = true;
+            }
+          } catch (e) {}
+          continue;
+        }
+        try {
+          const data = JSON.parse(payload);
+          if (!data.content) continue;
+          if (!divs[data.node]) {
+            const d = document.createElement('div');
+            d.className = 'bubble assistant';
+            const tag = nodeTag[data.node];
+            if (tag) {
+              const t = document.createElement('span');
+              t.className = 'tag';
+              t.textContent = tag;
+              d.appendChild(t);
+            }
+            chat.appendChild(d);
+            divs[data.node] = d;
+          }
+          divs[data.node].textContent += data.content;
+          chat.scrollTop = chat.scrollHeight;
+        } catch (e) {}
+      }
+    }
+    if (Object.keys(divs).length === 0 && !reviewShown && !finalShown) {
+      addBubble('(空回复)', 'assistant');
     }
   } catch (e) {
     removeTyping();
