@@ -22,18 +22,19 @@
 flowchart TB
     U[用户输入] --> IG[输入护栏<br/>PII / 提示注入检测]
     IG --> SUM[上下文压缩<br/>长会话摘要]
-    SUM --> SUP[Supervisor 主管<br/>多意图识别与路由]
-    SUP --> WA[weather_agent<br/>天气查询]
-    SUP --> TA[ticket_agent<br/>车票查询]
-    SUP --> CA[chat_agent<br/>闲聊]
-    WA --> OG[输出护栏<br/>幻觉 / 泄露 / 事实校验]
-    TA --> OG
-    CA --> OG
+    SUM --> SUP[Supervisor 主管<br/>一次规划：结构化路由输出多意图]
+    SUP -->|并行 fan-out| WA[weather_agent<br/>天气查询]
+    SUP -->|并行 fan-out| TA[ticket_agent<br/>车票查询]
+    SUP -->|并行 fan-out| CA[chat_agent<br/>闲聊]
+    WA --> JOIN[join<br/>结果聚合 fan-in]
+    TA --> JOIN
+    CA --> JOIN
+    JOIN --> OG[输出护栏<br/>幻觉 / 泄露 / 事实校验]
     OG --> HR[人工审核<br/>Human-in-the-loop]
     HR --> R[返回用户]
 ```
 
-单 Agent 模式（`agent.multi_agent: false`）则为经典流水线：`意图分析 → 参数规范化 → 工具路由 → 执行 → 反思 → 生成 → 护栏`，同一套 Harness 层复用。
+单 Agent 模式（`agent.multi_agent: false`）则为经典流水线：`意图分析 → 输入护栏 → 动态规划 → 工具执行 → 反思 → 生成 → 输出护栏 → 人工审核`，同一套 Harness 层复用。
 
 ### 技术栈
 
