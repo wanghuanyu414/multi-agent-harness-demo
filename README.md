@@ -8,8 +8,8 @@
 
 - **多 Agent 编排**：Supervisor 主管 + 3 个专职 Worker（天气 / 车票 / 闲聊），动态多意图路由与结果聚合
 - **安全护栏**：输入侧 PII / 提示注入检测，输出侧幻觉 / 提示词泄露 / 事实性校验，规则 + LLM 语义双轨判定，支持 `fail-open / fail-closed`
-- **驾驭工程（Harness）**：动态规划、反思循环、可观测性、人工审核（Human-in-the-loop）
-- **可靠性**：工具调用失败分类 + 指数退避重试，护栏降级策略，护栏模型独立部署（降低延迟与成本）
+- **Harness**：动态规划、反思循环、可观测性、人工审核（Human-in-the-loop）
+- **可靠性**：工具调用失败分类 + 指数退避重试，护栏降级策略，护栏模型独立部署
 - **评测体系**：`eval.py` 一键跑出准确率 / 召回 / F1 / 幻觉率 / 延迟百分位 / Token 消耗 / 工具成功率
 - **并发治理**：内置工具去阻塞（线程池）、会话检查点多后端（Redis / SQLite / Postgres）、Web 层滑动窗口限流
 - **66 个单元 / 集成测试**，GitHub Actions CI 全绿
@@ -34,13 +34,13 @@ flowchart TB
     HR --> R[返回用户]
 ```
 
-单 Agent 模式（`agent.multi_agent: false`）则为经典流水线：`输入护栏 → 上下文压缩 → 意图分析 → 动态规划 → 工具执行 → 反思 → 生成 → 输出护栏 → 人工审核`，同一套 Harness 层复用。
+单 Agent 模式（`agent.multi_agent: false`）则为经典流水线：`输入护栏 → 上下文压缩 → 意图分析 → 规划 → 工具执行 → 反思 → 生成 → 输出护栏 → 人工审核`，同一套 Harness 层复用。
 
 ### 技术栈
 
 - **LangGraph 1.0**：状态图编排，条件分支，检查点持久化
 - **MCP（Model Context Protocol）**：标准化工具调用，支持多服务器 stdio 传输
-- **LangChain + OpenAI / Anthropic**：LLM 集成，主模型与护栏模型解耦
+- **LangChain + OpenAI / Anthropic**：LLM 集成，主模型与护栏模型分离
 - **FastAPI + Uvicorn**：Web 服务，异步接口
 - **Redis / SQLite / Postgres**：会话检查点后端
 - **LangSmith**：云端追踪与评测（可选，可关闭）
@@ -49,7 +49,7 @@ flowchart TB
 
 | 模块 | 职责 | 位置 |
 |------|------|------|
-| 多 Agent 编排 | Supervisor 路由 + Worker 构建 | `agent/multiagent/` |
+| 多 Agent 编排 | Supervisor 任务拆解 + CoT 路由 + Worker 构建 | `agent/multiagent/` |
 | 安全护栏 | 输入 / 输出检测，规则 + LLM 语义判定 | `agent/harness/guardrails.py` |
 | 反思循环 | 空结果 / 工具错误重试 | `agent/harness/reflection.py` |
 | 动态规划 | 多步计划 + CoT | `agent/harness/planner.py` |
@@ -115,7 +115,7 @@ Web 接口：
 | `guardrail_llm` | 护栏专用模型（独立于主模型，支持 `anthropic` / `openai` 协议） |
 | `harness.guardrails` | 输入 / 输出护栏开关与模式（`blocking` / `warning`） |
 | `harness.reflection` | 反思重试次数与触发条件 |
-| `harness.planner` | 动态规划开关与最大步数 |
+| `harness.planner` | 规划开关与最大步数 |
 | `harness.human_review` | 人工审核开关与意图范围 |
 | `context.summarize` | 长会话压缩（token 预算触发） |
 | `rate_limit` | Web 层按 IP 滑动窗口限流 |
@@ -180,7 +180,7 @@ docker run -p 8092:8092 \
 travel_agent/
 ├── agent/
 │   ├── multiagent/          # 多 Agent：supervisor / skills / tools / graph
-│   ├── harness/             # 驾驭工程：guardrails / planner / reflection / observability
+│   ├── harness/             # Harness：guardrails / planner / reflection / observability
 │   ├── graph.py             # 单 Agent 工作流图
 │   ├── nodes.py             # 意图分析 / 路由 / 执行 / 生成节点
 │   ├── mcp_client.py        # MCP 多服务器客户端（失败分类 + 退避重试）
