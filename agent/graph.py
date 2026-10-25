@@ -1,4 +1,4 @@
-"""LangGraph 工作流图构建 —— 支持 Harness 驾驭工程层"""
+"""LangGraph 工作流图构建 —— 支持 Harness 层"""
 import logging
 from typing import Literal
 
@@ -41,12 +41,12 @@ def build_graph(llm: ChatOpenAI, mcp_client: MCPClient,
     """构建 LangGraph 工作流图
 
     基础工作流:
-        START → summarize → analyze_intent → route_tool → execute_tool → generate_response → END
+        START → summarize → analyze_intent → execute_tool → generate_response → END
 
     Harness 层（按配置启用）:
-        summarize → analyze_intent → input_guardrail → [route_tool | plan_execution]
+        input_guardrail → summarize → analyze_intent → plan_execution
             → execute_tool → reflect ⇄ execute_tool → generate_response
-            → output_guardrail → human_review → END
+                → output_guardrail → human_review → END
 
     Args:
         llm: ChatOpenAI 实例
@@ -91,7 +91,7 @@ def build_graph(llm: ChatOpenAI, mcp_client: MCPClient,
         planner_config = hc.get("planner", {})
 
         async def node(state: AgentState):
-            return await planner_node(state, llm, mcp_client, planner_config)
+            return await planner_node(state, guardrail_llm, mcp_client, planner_config)
         return node
 
     # ── 护栏节点工厂 ──────────────────────────────────────
@@ -122,7 +122,7 @@ def build_graph(llm: ChatOpenAI, mcp_client: MCPClient,
         reflect_config = hc.get("reflection", {})
 
         async def node(state: AgentState):
-            return await reflect_node(state, reflect_config, llm)
+            return await reflect_node(state, reflect_config, guardrail_llm)
         return node
 
     # ── 上下文压缩节点工厂（复用多 Agent 组件） ──────────────
@@ -161,6 +161,9 @@ def build_graph(llm: ChatOpenAI, mcp_client: MCPClient,
     workflow.add_node("generate_response", _trace("generate_response", _make_generate_response(guardrail_llm, memory, review_intents)))
 
     # 注册 Harness 节点
+    if has_planner:
+        workflow.add_node("plan_execution", _trace("plan_execution", _make_planner()))
+
     if has_input_guard:
         workflow.add_node("input_guardrail", _trace("input_guardrail", _make_input_guardrail()))
 
@@ -175,16 +178,25 @@ def build_graph(llm: ChatOpenAI, mcp_client: MCPClient,
 
     # ── 边的连接顺序（自上而下） ─────────────────────────
 
-    # 1. START → summarize → analyze_intent
-    workflow.add_edge(START, "summarize")
-    workflow.add_edge("summarize", "analyze_intent")
-
-    # 2. analyze_intent → [input_guardrail] → 分流（有工具调用 → execute_tool，否则 → generate_response）
+    # 1. START → [input_guardrail] → summarize → analyze_intent
     if has_input_guard:
-        workflow.add_edge("analyze_intent", "input_guardrail")
+        workflow.add_edge(START, "input_guardrail")
         workflow.add_conditional_edges(
             "input_guardrail",
-            _make_guard_router("execute_tool"),
+            _make_input_guard_router(),
+            {"summarize": "summarize", "generate_response": "generate_response"},
+        )
+        workflow.add_edge("summarize", "analyze_intent")
+    else:
+        workflow.add_edge(START, "summarize")
+        workflow.add_edge("summarize", "analyze_intent")
+
+    # 2. analyze_intent → [plan_execution] → 分流（有工具调用 → execute_tool，否则 → generate_response）
+    if has_planner:
+        workflow.add_edge("analyze_intent", "plan_execution")
+        workflow.add_conditional_edges(
+            "plan_execution",
+            _make_tool_calls_router(),
             {"execute_tool": "execute_tool", "generate_response": "generate_response"},
         )
     else:
@@ -240,15 +252,13 @@ def _make_tool_calls_router():
     return _route
 
 
-def _make_guard_router(tool_target: str):
-    """input_guardrail 之后：护栏拦截或无线工具调用 → generate_response，否则 → execute_tool"""
+def _make_input_guard_router():
+    """input_guardrail（最前）之后的路由：拦截 → generate_response，通过 → summarize"""
     def _route(state: AgentState) -> str:
         result = state.get("input_guardrail_result", {})
         if not result.get("passed") and result.get("mode") == "blocking":
             return "generate_response"
-        if state.get("tool_calls"):
-            return tool_target
-        return "generate_response"
+        return "summarize"
     return _route
 
 

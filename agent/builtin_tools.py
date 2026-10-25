@@ -1,6 +1,7 @@
 """内置工具 —— 不依赖外部 MCP 服务器的工具实现"""
 import json
 import logging
+import re
 import urllib.parse
 import urllib.request
 
@@ -97,19 +98,79 @@ def _search_city_code(city: str) -> str | None:
     return None
 
 
-def weather_builtin(city: str) -> dict:
-    """通过中国天气网（d1.weather.com.cn）查询城市实时天气（无需 API Key）
+def _fetch_7d_forecast(code: str) -> list[dict]:
+    """获取 7 天预报（解析 HTML 页面 weather/{code}.shtml）"""
+    url = f"http://www.weather.com.cn/weather/{code}.shtml"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "http://www.weather.com.cn/",
+    }
+    try:
+        with _no_proxy_open(url, headers) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        logger.warning(f"7 天预报获取失败: {e}")
+        return []
 
-    Args:
-        city: 城市名称（中文或英文）
+    m = re.search(r'<ul class="t clearfix">(.*?)</ul>', raw, re.S)
+    if not m:
+        return []
 
-    Returns:
-        结构化天气数据（温度、天气状况、湿度、风向风力、空气质量等）
+    days = []
+    for li in re.findall(r'<li.*?</li>', m.group(1), re.S):
+        h1 = re.search(r'<h1>(.*?)</h1>', li)
+        wea = re.search(r'class="wea"[^>]*>(.*?)</p>', li)
+        tem = re.search(r'<span>(.*?)</span>/<i>(.*?)</i>', li)
+        win = re.search(r'class="win"[^>]*>(.*?)</p>', li, re.S)
+        # 风向在 span 的 title 属性，等级在 <i> 里
+        wind = ""
+        if win:
+            win_dir = re.search(r'title="([^"]+)"', win.group(1))
+            win_level = re.search(r'<i>(.*?)</i>', win.group(1), re.S)
+            wind = " ".join(x for x in [
+                win_dir.group(1) if win_dir else "",
+                re.sub(r'<[^>]+>', '', win_level.group(1)).strip() if win_level else "",
+            ] if x)
+        days.append({
+            "date": h1.group(1).strip() if h1 else "",
+            "weather_desc": re.sub(r'<[^>]+>', '', wea.group(1)).strip() if wea else "",
+            "high_temp": tem.group(1).strip() if tem else "",
+            "low_temp": tem.group(2).strip().rstrip("℃") if tem else "",
+            "wind": wind,
+        })
+    return days
+
+
+def weather_builtin(city: str, day: int = 0) -> dict:
+    """查询城市天气（中国天气网，无需 API Key）。
+
+    day=0 返回实时天气（温度/天气/湿度/风/空气质量）；
+    day=1~6 返回未来第 N 天的预报（最高/最低温/天气/风）。
+
+    同步实现（urllib 阻塞式请求），由调用方放入线程池执行，避免阻塞事件循环。
     """
     code = _resolve_city_code(city) or _search_city_code(city)
     if not code:
         return {"error": f"未找到城市「{city}」的天气信息，请检查城市名称是否正确"}
 
+    # 未来预报
+    if day > 0:
+        days = _fetch_7d_forecast(code)
+        if not days:
+            return {"error": "天气预报服务暂时不可用，请稍后重试"}
+        if day >= len(days):
+            return {"error": f"仅支持未来 7 天预报（含今天），超出可查询范围"}
+        d = days[day]
+        return {
+            "city": city,
+            "date": d.get("date", ""),
+            "weather_desc": d.get("weather_desc", "N/A"),
+            "high_temp": d.get("high_temp", "N/A"),
+            "low_temp": d.get("low_temp", "N/A"),
+            "wind": d.get("wind", "N/A"),
+        }
+
+    # 实时
     url = f"http://d1.weather.com.cn/sk_2d/{code}.html"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -149,11 +210,12 @@ def weather_builtin(city: str) -> dict:
 BUILTIN_TOOLS: dict[str, dict] = {
     "get_weather": {
         "name": "get_weather",
-        "description": "查询城市实时天气信息（通过中国天气网）",
+        "description": "查询城市天气（今天实时或未来 7 天预报）",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "city": {"type": "string", "description": "城市名称，如 北京、上海"}
+                "city": {"type": "string", "description": "城市名称，如 北京、上海"},
+                "day": {"type": "integer", "description": "预报天数偏移：0=今天(实时)，1=明天，2=后天，最多 6"},
             },
             "required": ["city"],
         },

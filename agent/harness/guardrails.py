@@ -216,7 +216,7 @@ def sanitize_tool_output(result):
 
 class FactCheckVerdict(BaseModel):
     """事实性校验结果"""
-    is_hallucinated: bool
+    is_fabricated: bool
     reason: str = ""
 
 
@@ -236,7 +236,7 @@ async def _llm_fact_check(llm, response: str, ground_truth: str, on_error: str =
             SystemMessage(content="你是事实性校验员，判断回复是否与工具数据一致。"),
             HumanMessage(content=prompt),
         ])
-        return bool(verdict.is_hallucinated), (verdict.reason or "").strip()
+        return bool(verdict.is_fabricated), (verdict.reason or "").strip()
     except Exception as e:
         if on_error == "closed":
             logger.error("LLM 事实性校验失败，按幻觉处理（fail-closed）: %s", e)
@@ -357,8 +357,8 @@ async def input_guardrail_node(state: AgentState, config: dict, llm=None) -> dic
 async def _async_fact_check(llm, final_response, ground_truth, on_error):
     """后台事实校验：命中只告警，不阻塞主流程。"""
     try:
-        is_hallucinated, reason = await _llm_fact_check(llm, final_response, ground_truth, on_error=on_error)
-        if is_hallucinated:
+        is_fabricated, reason = await _llm_fact_check(llm, final_response, ground_truth, on_error=on_error)
+        if is_fabricated:
             logger.warning("输出护栏事实校验命中(异步): %s", reason or "")
     except Exception as e:
         logger.warning(f"异步事实校验失败: {e}")

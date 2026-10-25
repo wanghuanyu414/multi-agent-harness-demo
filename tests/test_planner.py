@@ -1,37 +1,34 @@
-from agent.harness.planner import _validate_plan
+import asyncio
+
+from langchain_core.messages import AIMessage, HumanMessage
+
+from agent.harness.planner import planner_node
 
 
-class FakeMCP:
-    def __init__(self, tools):
-        self._tools = tools
-
-    def find_tool(self, server, hint=""):
-        for srv, name in self._tools:
-            if srv == server and (not hint or hint.lower() in name.lower()):
-                return {"name": name}
-        return None
+class FakeLLM:
+    async def ainvoke(self, messages, **kwargs):
+        return AIMessage(content=(
+            '{"reasoning": "先查天气", "steps": [{"step": 0, "tool": "get_weather", "reason": "查天气"}]}'
+        ))
 
 
-def test_validate_plan_valid():
-    mcp = FakeMCP([("weather", "get_weather")])
-    plan = {"steps": [{"tool_server": "weather", "tool_name": "get_weather"}]}
-    assert _validate_plan(plan, mcp) is True
+def _state():
+    return {
+        "intent": "weather",
+        "tool_calls": [{"name": "get_weather", "args": {"city": "北京"}, "id": "c1"}],
+        "messages": [HumanMessage(content="北京天气")],
+    }
 
 
-def test_validate_plan_missing_tool():
-    mcp = FakeMCP([("weather", "get_weather")])
-    plan = {"steps": [{"tool_server": "weather", "tool_name": "nope"}]}
-    assert _validate_plan(plan, mcp) is False
+def test_planner_keeps_tool_calls():
+    """planner 不覆盖 function calling 的 tool_calls（消除与 analyze_intent 的重叠）"""
+    state = _state()
+    result = asyncio.run(planner_node(state, FakeLLM()))
+    assert result["tool_calls"] == state["tool_calls"]
+    assert result["plan_reasoning"] == "先查天气"
+    assert result["execution_plan"][0]["tool"] == "get_weather"
 
 
-def test_validate_plan_missing_fields():
-    mcp = FakeMCP([("weather", "get_weather")])
-    plan = {"steps": [{"tool_name": "get_weather"}]}  # 缺 tool_server
-    assert _validate_plan(plan, mcp) is False
-
-
-def test_validate_plan_empty():
-    mcp = FakeMCP([])
-    assert _validate_plan(None, mcp) is False
-    assert _validate_plan({}, mcp) is False
-    assert _validate_plan({"steps": []}, mcp) is False
+def test_planner_chat_noop():
+    result = asyncio.run(planner_node({"intent": "chat", "tool_calls": []}, FakeLLM()))
+    assert result == {"intent": "chat"}

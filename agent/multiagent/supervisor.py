@@ -27,7 +27,7 @@ async def _run_skill_script(skill, script_name: str, input_text: str) -> str | N
         return None
     return await run_skill_script(md_path, script_name, input_text)
 
-# 多意图兜底关键词：路由漏识别时，按领域关键词确定性补发缺失的 Agent
+# 多意图兜底关键词：路由未命中时，按领域关键词补发缺失的 Agent
 _INTENT_BACKFILL_KEYWORDS = {
     "weather_agent": (
         "天气", "气温", "温度", "下雨", "晴天", "阴天", "雾霾", "空气质量",
@@ -43,8 +43,8 @@ _INTENT_BACKFILL_KEYWORDS = {
 
 def _backfill_multi_intent(agents: list[str], user_text: str) -> list[str]:
     """多意图兜底：supervisor 做结构化路由，偶发对并列句式
-    （如「帮我查天气 + 帮我查车票」）只识别出第一个意图。这里用关键词确定性补发，
-    保证天气/车票意图不因模型漏判而丢失。"""
+    （如「帮我查天气 + 帮我查车票」）只识别出第一个意图。这里用关键词补发，
+    保证天气/车票意图不因未命中而丢失。"""
     result = list(agents)
     for agent, keywords in _INTENT_BACKFILL_KEYWORDS.items():
         if agent not in result and any(kw in user_text for kw in keywords):
@@ -254,7 +254,17 @@ async def _run_react(llm, tools, skill, prefix, input_messages, name, review_int
             # 车票查询结果用 skill 脚本格式化（第 3 级）
             # use_format_script=False 时跳过脚本，原始 JSON 交给 LLM 流式格式化
             if use_format_script and skill.intent == "ticket" and tc.get("name") == "query-tickets":
-                formatted = await _run_skill_script(skill, "format_tickets.py", result)
+                # result 是 MCP wrapper（{"content":[{"text":"..."}]}），需先取出内层 query-tickets 原始 JSON
+                fmt_input = result
+                try:
+                    parsed = json.loads(result) if isinstance(result, str) else result
+                    if isinstance(parsed, dict):
+                        content = parsed.get("content", [])
+                        if isinstance(content, list) and content and isinstance(content[0], dict):
+                            fmt_input = content[0].get("text", result)
+                except (ValueError, TypeError):
+                    pass
+                formatted = await _run_skill_script(skill, "format_tickets.py", fmt_input)
                 if formatted:
                     result = formatted
             messages.append(ToolMessage(content=result, tool_call_id=tc.get("id")))
@@ -316,7 +326,7 @@ def make_agent_node(llm, tools, skill, memory=None, memory_llm=None, review_inte
             prefix.append(SystemMessage(content="## 用户长期记忆\n" + memory_context))
 
         # 整轮级审核判断：本轮派发的任一 Agent 命中审核意图，则本轮所有 Worker 都禁用流式，
-        # 统一走 human_review 闭环
+        # 统一走 human_review 闭环。
         turn_needs_review = None
         if agent_to_intent is not None:
             turn_needs_review = bool(review_intents) and any(

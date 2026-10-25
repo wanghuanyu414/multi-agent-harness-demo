@@ -2,7 +2,7 @@
 import json
 import logging
 from copy import deepcopy
-from typing import Any
+from typing import Any, Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel
@@ -83,10 +83,32 @@ def _adjust_ticket_args(tool_args: dict, retry_count: int) -> dict:
     return args
 
 
-_ADJUSTERS: dict[str, callable] = {
+_ADJUSTERS: dict[str, Callable] = {
     "weather": _adjust_weather_args,
     "ticket": _adjust_ticket_args,
 }
+
+
+def _adjuster_for_tool(tool_name: str) -> Callable | None:
+    """按工具名匹配参数调整器（function calling 流程，工具名 → 领域调整器）"""
+    if "weather" in tool_name:
+        return _adjust_weather_args
+    if any(k in tool_name for k in ("ticket", "train", "station", "12306")):
+        return _adjust_ticket_args
+    return None
+
+
+def _adjust_tool_calls(tool_calls: list, retry_count: int) -> list:
+    """调整 function calling 产出的 tool_calls 的参数（逐个工具按名匹配调整器）"""
+    adjusted = []
+    for tc in tool_calls:
+        adjuster = _adjuster_for_tool(tc.get("name", ""))
+        if adjuster:
+            args = adjuster(tc.get("args", {}), retry_count)
+            adjusted.append({**tc, "args": args})
+        else:
+            adjusted.append(tc)
+    return adjusted
 
 
 # ============================================================
@@ -219,19 +241,19 @@ async def reflect_node(state: AgentState, config: dict, llm=None) -> dict[str, A
             and config.get("retry_on", {}).get("low_quality")
             and llm is not None):
         user_query = _latest_user_text(state.get("messages", []))
-        evaluation = await _evaluate_quality(llm, mcp_result, intent, user_query)
+        quality_result = tool_results if tool_results else state.get("mcp_result", {})
+        evaluation = await _evaluate_quality(llm, quality_result, intent, user_query)
 
     if evaluation["needs_retry"] and retry_count < max_retries:
         new_retry_count = retry_count + 1
-        adjuster = _ADJUSTERS.get(intent)
-        new_args = adjuster(tool_args, retry_count) if adjuster else tool_args
+        new_tool_calls = _adjust_tool_calls(state.get("tool_calls", []), retry_count)
 
         logger.info(f"反思: 需要重试 ({new_retry_count}/{max_retries})，原因: {evaluation['reason']}")
         return {
             "retry_count": new_retry_count,
             "max_retries": max_retries,
             "reflection_notes": f"retry: {evaluation['reason']}",
-            "tool_args": new_args,
+            "tool_calls": new_tool_calls,
         }
 
     if evaluation["needs_retry"]:

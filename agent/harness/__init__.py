@@ -1,4 +1,4 @@
-"""Harness Agent (驾驭工程) 层 —— 安全护栏、反思循环、动态规划、可观测性"""
+"""Harness Agent 层 —— 安全护栏、反思循环、规划、可观测性"""
 
 from .guardrails import input_guardrail_node, output_guardrail_node
 from .reflection import reflect_node

@@ -34,7 +34,7 @@ flowchart TB
     HR --> R[返回用户]
 ```
 
-单 Agent 模式（`agent.multi_agent: false`）则为经典流水线：`意图分析 → 输入护栏 → 动态规划 → 工具执行 → 反思 → 生成 → 输出护栏 → 人工审核`，同一套 Harness 层复用。
+单 Agent 模式（`agent.multi_agent: false`）则为经典流水线：`输入护栏 → 上下文压缩 → 意图分析 → 动态规划 → 工具执行 → 反思 → 生成 → 输出护栏 → 人工审核`，同一套 Harness 层复用。
 
 ### 技术栈
 

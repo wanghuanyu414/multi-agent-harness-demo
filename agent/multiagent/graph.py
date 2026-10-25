@@ -70,7 +70,7 @@ def build_multi_agent_graph(llm: ChatOpenAI, mcp_client, config: dict | None = N
     human_review_enabled = bool(human_review_config.get("enabled", False))
     review_intents = set(human_review_config.get("intents", [])) if human_review_enabled else set()
 
-    # 车票格式化脚本开关（默认关 → LLM 流式格式化）
+    # 车票格式化脚本开关
     use_format_script = bool(config.get("streaming", {}).get("ticket_format_script", False))
 
     # 护栏配置

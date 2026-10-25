@@ -1,4 +1,8 @@
-"""MCP 客户端封装 —— 支持多服务器、stdio 传输、JSON-RPC 协议"""
+"""MCP 客户端封装 —— 支持多服务器、stdio / Streamable HTTP 传输
+
+基于官方 mcp SDK（Client + stdio_client / streamable_http_client）统一传输层；
+保留 MCPClient 层的失败分类、退避重试、健康检查、内置工具与工具注册表。
+"""
 import asyncio
 import json
 import logging
@@ -14,6 +18,37 @@ from mcp.client.streamable_http import streamable_http_client
 from .tool_errors import ToolCallError, classify_exception, NOT_FOUND, CONNECTION
 
 logger = logging.getLogger(__name__)
+
+# 工具结果 TTL 缓存
+_TOOL_CACHE_TTL: dict[str, float] = {
+    "get_weather": 600.0,          # 天气 10 分钟
+    "query-tickets": 300.0,        # 车票余票 5 分钟（余票实时变动）
+    "query-ticket-price": 300.0,   # 票价 5 分钟
+    "search-stations": 3600.0,     # 车站列表 1 小时（基本静态）
+}
+
+
+class ToolResultCache:
+    """进程内 TTL 缓存"""
+    def __init__(self, max_size: int = 256):
+        self._cache: dict = {}
+        self._max_size = max_size
+
+    def get(self, key):
+        item = self._cache.get(key)
+        if item is None:
+            return None
+        expire_at, result = item
+        if time.monotonic() >= expire_at:
+            del self._cache[key]
+            return None
+        return result
+
+    def set(self, key, result, ttl: float):
+        if len(self._cache) >= self._max_size:
+            oldest = min(self._cache, key=lambda k: self._cache[k][0])
+            del self._cache[oldest]
+        self._cache[key] = (time.monotonic() + ttl, result)
 
 
 def _tool_to_dict(tool) -> dict:
@@ -173,6 +208,7 @@ class MCPClient:
         """服务器名 -> 启动失败原因"""
         self._server_domains: dict[str, str] = {}
         """服务器名 -> 领域归属（从 config 的 domain 字段读，供多 Agent 按领域分发工具）"""
+        self._tool_cache = ToolResultCache()
         for cfg in server_configs:
             if not cfg.get("domain"):
                 continue
@@ -359,6 +395,16 @@ class MCPClient:
         from .metrics import MetricsCollector, count_tokens
         metrics = MetricsCollector.get()
 
+        # 工具结果缓存
+        cache_key = None
+        ttl = _TOOL_CACHE_TTL.get(tool_name, 0)
+        if ttl > 0:
+            cache_key = (server_name, tool_name, json.dumps(arguments, sort_keys=True, ensure_ascii=False))
+            cached = self._tool_cache.get(cache_key)
+            if cached is not None:
+                metrics.record_tool(tool_name, True, 0.0, count_tokens(str(cached)))
+                return cached
+
         for attempt in range(max_retries + 1):
             start = time.monotonic()
             try:
@@ -386,6 +432,8 @@ class MCPClient:
                 err = classify_exception(e)
             else:
                 metrics.record_tool(tool_name, True, (time.monotonic() - start) * 1000, count_tokens(str(result)))
+                if cache_key is not None:
+                    self._tool_cache.set(cache_key, result, ttl)
                 return result
 
             metrics.record_tool(tool_name, False, (time.monotonic() - start) * 1000)

@@ -112,10 +112,11 @@ class MetricsCollector:
             st["durations"].append(duration_ms)
             st["tokens"].append(tokens)
 
-    def add_tokens(self, input_tokens: int = 0, output_tokens: int = 0) -> None:
+    def add_tokens(self, input_tokens: int = 0, output_tokens: int = 0, cached_tokens: int = 0) -> None:
         with self._lock:
             self.tokens["input"] += input_tokens
             self.tokens["output"] += output_tokens
+            self.tokens["cached"] += cached_tokens
             self.tokens["total"] += input_tokens + output_tokens
 
     # ---- 汇总 ----
@@ -160,21 +161,22 @@ _request_tokens: contextvars.ContextVar = contextvars.ContextVar("request_tokens
 
 def start_request_tokens() -> None:
     """请求开始：初始化当前请求（context）的 token 计数。"""
-    _request_tokens.set({"input": 0, "output": 0})
+    _request_tokens.set({"input": 0, "output": 0, "cached": 0})
 
 
-def add_request_tokens(input_tokens: int = 0, output_tokens: int = 0) -> None:
+def add_request_tokens(input_tokens: int = 0, output_tokens: int = 0, cached_tokens: int = 0) -> None:
     """在请求级上下文累加 token（并发安全，仅影响当前请求 context）。"""
     tok = _request_tokens.get()
     if tok is not None:
         tok["input"] += input_tokens
         tok["output"] += output_tokens
+        tok["cached"] += cached_tokens
 
 
 def get_request_tokens() -> dict:
-    """请求结束：返回本次请求的 token 用量（input/output）。"""
+    """请求结束：返回本次请求的 token 用量（input/output/cached）。"""
     tok = _request_tokens.get()
-    return dict(tok) if tok else {"input": 0, "output": 0}
+    return dict(tok) if tok else {"input": 0, "output": 0, "cached": 0}
 
 
 # 请求级 token 流式队列（contextvars，Worker 流式生成时写入，web 层读取）
@@ -205,12 +207,22 @@ class TokenUsageCallbackHandler(BaseCallbackHandler):
     def on_llm_end(self, response, **kwargs) -> None:
         input_tokens = 0
         output_tokens = 0
+        cached_tokens = 0
+
+        def _cached(um: dict) -> int:
+            # OpenAI 兼容端点：prompt_tokens_details / input_token_details 里带 cached_tokens
+            for k in ("input_token_details", "prompt_tokens_details"):
+                d = um.get(k)
+                if isinstance(d, dict) and d.get("cached_tokens"):
+                    return int(d["cached_tokens"])
+            return 0
 
         llm_output = getattr(response, "llm_output", None) or {}
         tu = llm_output.get("token_usage") or {}
         if tu:
             input_tokens = tu.get("prompt_tokens") or tu.get("input_tokens") or 0
             output_tokens = tu.get("completion_tokens") or tu.get("output_tokens") or 0
+            cached_tokens = _cached(tu)
         else:
             for gen_list in (getattr(response, "generations", None) or []):
                 for g in gen_list:
@@ -221,10 +233,11 @@ class TokenUsageCallbackHandler(BaseCallbackHandler):
                         um = gi.get("usage_metadata") or gi.get("token_usage") or {}
                     input_tokens += um.get("input_tokens") or um.get("prompt_tokens") or 0
                     output_tokens += um.get("output_tokens") or um.get("completion_tokens") or 0
+                    cached_tokens += _cached(um)
 
         if input_tokens or output_tokens:
-            self.collector.add_tokens(input_tokens, output_tokens)
-            add_request_tokens(input_tokens, output_tokens)
+            self.collector.add_tokens(input_tokens, output_tokens, cached_tokens)
+            add_request_tokens(input_tokens, output_tokens, cached_tokens)
             self.calls += 1
 
 

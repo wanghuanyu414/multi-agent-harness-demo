@@ -116,6 +116,11 @@ def _keyword_intent(text: str) -> dict:
         return {"intent": "chat", "city": None, "from_city": None, "to_city": None, "date": None}
 
 
+# 关键词兜底
+_TICKET_BACKFILL = ("车票", "火车票", "高铁", "动车", "车次", "余票", "订票", "购票", "列车", "12306")
+_WEATHER_BACKFILL = ("天气", "气温", "温度", "下雨", "晴天", "阴天", "湿度", "风力")
+
+
 async def analyze_intent_node(state: AgentState, llm: ChatOpenAI, tools: list,
                               tool_domain: dict | None = None) -> dict[str, Any]:
     """意图分析 + 工具调用"""
@@ -139,6 +144,26 @@ async def analyze_intent_node(state: AgentState, llm: ChatOpenAI, tools: list,
     except Exception as e:
         logger.warning(f"LLM 工具调用分析失败: {e}")
         tool_calls = []
+
+    # 关键词兜底：强制重试一次提取参数
+    if not tool_calls:
+        backfill = None
+        if any(kw in user_text for kw in _TICKET_BACKFILL):
+            backfill = "车票"
+        elif any(kw in user_text for kw in _WEATHER_BACKFILL):
+            backfill = "天气"
+        if backfill:
+            force_prompt = get_prompt("intent", INTENT_PROMPT) + \
+                f"\n\n注意：用户输入包含明确的{backfill}查询，你必须调用相应工具并提取参数，不要返回空。"
+            try:
+                response = await ainvoke_with_retry(
+                    llm.bind_tools(tools),
+                    [SystemMessage(content=force_prompt), HumanMessage(content=user_text)],
+                )
+                tool_calls = list(getattr(response, "tool_calls", None) or [])
+            except Exception as e:
+                logger.warning(f"关键词兜底重试失败: {e}")
+                tool_calls = []
 
     # 规范化参数（日期 → YYYY-MM-DD，城市/车站 → 标准名）
     normalized_calls = []
